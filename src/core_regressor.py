@@ -15,7 +15,7 @@ import plotly.express as px
 import joblib
 
 # Local imports
-from .cpu_temp_bundled import HardwareMonitor
+from src.cpu_temp_bundled import HardwareMonitor
 
 
 class CoreTempRegressor:
@@ -23,6 +23,17 @@ class CoreTempRegressor:
     CPU Temperature anomaly detection using regression models.
     Can be used for training, saving/loading models, and real-time anomaly detection.
     """
+    
+    PLOT_STYLE = {
+        'line_width': 3,
+        'marker_size': 8,
+        'threshold_line_width': 5,
+        'threshold_opacity': 0.5,
+        'error_color': 'orange',
+        'lower_threshold_color': 'green',
+        'upper_threshold_color': 'red',
+        'line_dash': 'dash'
+    }
 
     def __init__(self):
         self.scaler = None
@@ -43,6 +54,7 @@ class CoreTempRegressor:
 
         # Store model name
         self.model_name = None
+        self.multi_variable = True
 
         # Anomaly detection thresholds
         self.low_threshold = None
@@ -56,7 +68,7 @@ class CoreTempRegressor:
         # Feature columns (set after training)
         self.feature_columns = None
 
-    def configure_model(self, model='linear', scaler='standard', use_time_features=True, lag_steps=[1, 2, 3], rolling_windows=[3, 5, 7]):
+    def configure_model(self, model='linear', multi_variable = True, scaler='standard', use_time_features=True, lag_steps=[1, 2, 3], rolling_windows=[3, 5, 7]):
         """Configure the model and scaler to use."""
         scaler_dict = {
             'standard': StandardScaler(),
@@ -102,6 +114,7 @@ class CoreTempRegressor:
         self.lag_steps = lag_steps
         self.rolling_windows = rolling_windows
         self.use_time_features = use_time_features
+        self.multi_variable = multi_variable
 
     def extract_CPU_data(self, iterations=100, interval=5, csv=False, progress_callback=None, should_stop_callback=None):
         """
@@ -110,12 +123,12 @@ class CoreTempRegressor:
         Args:
             iterations: Number of data points to collect
             interval: Time between collections (seconds)
-            csv: If True, load from data.csv instead
+            csv: If True, load from ../data/data.csv
             progress_callback: Optional callback function(current, total) for progress updates
-            should_stop_callback: Optional callback that returns True if should stop collection
+            should_stop_callback: Optional callback function() that returns True to stop collection
         """
         if csv:
-            self.data = pd.read_csv('data.csv')
+            self.data = pd.read_csv('../data/data.csv')
             if 'timestamp' in self.data.columns:
                 self.data['timestamp'] = pd.to_datetime(self.data['timestamp'])
         else:
@@ -182,7 +195,7 @@ class CoreTempRegressor:
         test_data = self.data[split_idx:].copy()
 
         # Apply time features SEPARATELY to train and test
-        if self.use_time_features:
+        if self.use_time_features == True and self.multi_variable == True:
             train_data = self.create_time_features_on_df(train_data, self.lag_steps, self.rolling_windows)
             test_data = self.create_time_features_on_df(test_data, self.lag_steps, self.rolling_windows)
 
@@ -190,11 +203,19 @@ class CoreTempRegressor:
             test_data = test_data.dropna()
 
         # Prepare X and y
-        x_train = train_data.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1)
-        y_train = train_data['cpu_temp']
+        if self.multi_variable == True:
+            x_train = train_data.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1)
+            y_train = train_data['cpu_temp']
 
-        self.x_test = test_data.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1)
-        self.y_test = test_data['cpu_temp']
+            self.x_test = test_data.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1)
+            self.y_test = test_data['cpu_temp']
+        
+        else:
+            x_train = train_data[['time']]
+            y_train = train_data['cpu_temp']
+
+            self.x_test = test_data[['time']]
+            self.y_test = test_data['cpu_temp']
 
         # Store feature columns for later use
         self.feature_columns = list(x_train.columns)
@@ -284,7 +305,7 @@ class CoreTempRegressor:
         df = pd.DataFrame(list(self.data_buffer))
 
         # Apply time features
-        if self.use_time_features:
+        if self.use_time_features == True and self.multi_variable == True:
             df = self.create_time_features_on_df(df, self.lag_steps, self.rolling_windows)
             df = df.dropna()
 
@@ -295,8 +316,12 @@ class CoreTempRegressor:
         last_row = df.iloc[[-1]]
 
         # Prepare features
-        X = last_row.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1, errors='ignore')
+        if self.multi_variable == True:
+            X = last_row.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1, errors='ignore')
 
+        else:
+            X = last_row[['time']]
+            
         # Ensure columns match training
         if self.feature_columns:
             missing_cols = set(self.feature_columns) - set(X.columns)
@@ -313,6 +338,67 @@ class CoreTempRegressor:
         is_anomaly = diff < self.low_threshold or diff > self.high_threshold
 
         return is_anomaly, diff, predicted, actual
+    
+    def plot_predictions(self, threshold_std=1.5):
+        # Use stored test_data time values
+        time_test = self.test_data['time'].values
+        timestamp_test = self.test_data['timestamp'].values
+
+        # Get model name for titles
+        model_display_name = self.model_name.upper() if self.model_name else "Model"
+
+        # Prepare data
+        df_test = self.x_test.copy()
+        df_test['time'] = time_test
+        df_test['timestamp'] = timestamp_test
+        df_test["Actual"] = self.y_test.values
+        df_test["Predicted"] = self.y_pred
+        df_test = df_test.sort_values("time")
+
+        df_test["diff"] = df_test["Actual"] - df_test["Predicted"]
+        mean_diff = df_test["diff"].mean()
+        stardard_dev = df_test["diff"].std()
+        low_lim = mean_diff - threshold_std * stardard_dev
+        high_lim = mean_diff + threshold_std * stardard_dev
+
+        # Transform to long format (better for px.line)
+        df_plot = df_test.melt(id_vars="timestamp", value_vars=["diff"], var_name="Type", value_name="Temperature Diff")
+
+        # Predictions plot
+        fig_pred = px.line(df_test, x="timestamp", y=["Actual", "Predicted"], title=f"{model_display_name} Regression: CPU Temp: Predicted vs Actual")
+        fig_pred.update_traces(
+            line_width=self.PLOT_STYLE['line_width'], 
+            marker=dict(size=self.PLOT_STYLE['marker_size'])
+        )
+        fig_pred.show()
+
+        # Error plot
+        fig = px.line(df_plot, x="timestamp", y="Temperature Diff", color="Type", title=f"{model_display_name} Regression: CPU Temp Difference: Predicted vs Actual")
+        fig.update_traces(
+            line_color=self.PLOT_STYLE['error_color'], 
+            line_width=self.PLOT_STYLE['line_width'], 
+            marker=dict(size=self.PLOT_STYLE['marker_size'])
+        )
+        fig.add_hline(
+            y=low_lim, 
+            line_width=self.PLOT_STYLE['threshold_line_width'], 
+            line_color=self.PLOT_STYLE['lower_threshold_color'], 
+            line_dash=self.PLOT_STYLE['line_dash'], 
+            opacity=self.PLOT_STYLE['threshold_opacity']
+        )
+        fig.add_hline(
+            y=high_lim, 
+            line_width=self.PLOT_STYLE['threshold_line_width'], 
+            line_color=self.PLOT_STYLE['upper_threshold_color'], 
+            line_dash=self.PLOT_STYLE['line_dash'], 
+            opacity=self.PLOT_STYLE['threshold_opacity']
+        )
+        fig.show()
+
+        # Anomaly detection plot
+        df_test["anomaly"] = (df_test["diff"] > high_lim) | (df_test["diff"] < low_lim)
+        fig_anom = px.line(df_test, x="timestamp", y="anomaly", color="anomaly", title=f"{model_display_name} Regression: Anomaly Detection", markers=True)
+        fig_anom.show()
 
     def evaluate_metrics(self):
         """Calculate and return evaluation metrics."""

@@ -28,6 +28,7 @@ class ConfigManager:
         'minimize_to_tray': True,
         'last_model_type': 'lightgbm',
         'last_scaler': 'standard',
+        'multi_variable': True,
         'training_iterations': 1000,
         'training_interval': 1
     }
@@ -68,8 +69,8 @@ class CPUTempMonitorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("CPU Temperature Monitor")
-        self.root.geometry("500x450")
-        self.root.resizable(False, False)
+        self.root.geometry("550x600")
+        self.root.resizable(True, True)
 
         # Config
         self.config = ConfigManager()
@@ -93,22 +94,65 @@ class CPUTempMonitorApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # Create tabs
-        self.train_tab = ttk.Frame(self.notebook)
-        self.monitor_tab = ttk.Frame(self.notebook)
-        self.settings_tab = ttk.Frame(self.notebook)
+        # Create scrollable tabs
+        self.train_tab = self.create_scrollable_frame(self.notebook)
+        self.monitor_tab = self.create_scrollable_frame(self.notebook)
+        self.settings_tab = self.create_scrollable_frame(self.notebook)
 
-        self.notebook.add(self.train_tab, text='  Train  ')
-        self.notebook.add(self.monitor_tab, text='  Monitor  ')
-        self.notebook.add(self.settings_tab, text='  Settings  ')
+        self.notebook.add(self.train_tab['outer'], text='  Train  ')
+        self.notebook.add(self.monitor_tab['outer'], text='  Monitor  ')
+        self.notebook.add(self.settings_tab['outer'], text='  Settings  ')
 
         self.setup_train_tab()
         self.setup_monitor_tab()
         self.setup_settings_tab()
 
+    def create_scrollable_frame(self, parent):
+        """Create a scrollable frame with scrollbar."""
+        # Outer frame
+        outer_frame = ttk.Frame(parent)
+
+        # Canvas for scrolling
+        canvas = tk.Canvas(outer_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer_frame, orient="vertical", command=canvas.yview)
+
+        # Inner frame that will hold content
+        inner_frame = ttk.Frame(canvas)
+
+        # Configure canvas
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Pack scrollbar and canvas
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        # Create window in canvas
+        canvas_frame = canvas.create_window((0, 0), window=inner_frame, anchor="nw")
+
+        # Update scroll region when frame size changes
+        def on_frame_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        inner_frame.bind("<Configure>", on_frame_configure)
+
+        # Bind mousewheel for scrolling
+        def on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        def bind_mousewheel(event):
+            canvas.bind_all("<MouseWheel>", on_mousewheel)
+
+        def unbind_mousewheel(event):
+            canvas.unbind_all("<MouseWheel>")
+
+        outer_frame.bind("<Enter>", bind_mousewheel)
+        outer_frame.bind("<Leave>", unbind_mousewheel)
+
+        return {'outer': outer_frame, 'inner': inner_frame, 'canvas': canvas}
+
     def setup_train_tab(self):
         """Setup the training tab."""
-        frame = self.train_tab
+        frame = self.train_tab['inner']
 
         # Model selection
         model_frame = ttk.LabelFrame(frame, text="Model Configuration", padding=10)
@@ -125,6 +169,12 @@ class CPUTempMonitorApp:
         scaler_combo = ttk.Combobox(model_frame, textvariable=self.scaler_var,
                                     values=['standard', 'minmax', 'robust'], state='readonly', width=15)
         scaler_combo.grid(row=1, column=1, pady=2, padx=5)
+
+        # Multi-variable checkbox
+        self.multi_variable_var = tk.BooleanVar(value=self.config.get('multi_variable', True))
+        multi_var_check = ttk.Checkbutton(model_frame, text="Use all sensors (multi-variable mode)",
+                                          variable=self.multi_variable_var)
+        multi_var_check.grid(row=2, column=0, columnspan=2, sticky='w', pady=5)
 
         # Training parameters
         param_frame = ttk.LabelFrame(frame, text="Training Parameters", padding=10)
@@ -189,7 +239,7 @@ class CPUTempMonitorApp:
 
     def setup_monitor_tab(self):
         """Setup the monitoring tab."""
-        frame = self.monitor_tab
+        frame = self.monitor_tab['inner']
 
         # Model selection
         model_frame = ttk.LabelFrame(frame, text="Model Selection", padding=10)
@@ -235,7 +285,7 @@ class CPUTempMonitorApp:
 
     def setup_settings_tab(self):
         """Setup the settings tab."""
-        frame = self.settings_tab
+        frame = self.settings_tab['inner']
 
         # General settings
         general_frame = ttk.LabelFrame(frame, text="General", padding=10)
@@ -301,6 +351,7 @@ class CPUTempMonitorApp:
         self.regressor = CoreTempRegressor()
         self.regressor.configure_model(
             model=self.model_type_var.get(),
+            multi_variable=self.multi_variable_var.get(),
             scaler=self.scaler_var.get(),
             use_time_features=True
         )
@@ -387,6 +438,7 @@ class CPUTempMonitorApp:
             # Update config
             self.config.set('last_model_type', model_type)
             self.config.set('last_scaler', self.scaler_var.get())
+            self.config.set('multi_variable', self.multi_variable_var.get())
             self.config.set('model_path', path)
             self.config.save()
 
@@ -435,6 +487,7 @@ class CPUTempMonitorApp:
             # Configure model
             self.regressor.configure_model(
                 model=self.model_type_var.get(),
+                multi_variable=self.multi_variable_var.get(),
                 scaler=self.scaler_var.get(),
                 use_time_features=True
             )
@@ -596,6 +649,7 @@ class CPUTempMonitorApp:
         self.config.set('notifications_enabled', self.notifications_var.get())
         self.config.set('minimize_to_tray', self.minimize_var.get())
         self.config.set('threshold_std', self.threshold_var.get())
+        self.config.set('multi_variable', self.multi_variable_var.get())
         self.config.set('training_iterations', self.iterations_var.get())
         self.config.set('training_interval', self.interval_var.get())
         self.config.save()
