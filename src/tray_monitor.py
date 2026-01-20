@@ -62,9 +62,12 @@ class TrayMonitor:
 
         # Status info
         self.current_temp = 0.0
+        self.predicted_temp = 0.0
         self.last_diff = 0.0
         self.anomaly_count = 0
         self.last_anomaly_time = None
+        self.low_threshold = 0.0
+        self.high_threshold = 0.0
 
     def load_model(self, path: str = None):
         """Load the trained model."""
@@ -72,6 +75,10 @@ class TrayMonitor:
             self.model_path = path
         if self.model_path:
             self.regressor = CoreTempRegressor.load_model(self.model_path)
+            # Get thresholds from model
+            if self.regressor.low_threshold is not None:
+                self.low_threshold = self.regressor.low_threshold
+                self.high_threshold = self.regressor.high_threshold
             return True
         return False
 
@@ -113,6 +120,7 @@ class TrayMonitor:
                 # Detect anomaly
                 is_anomaly, diff, predicted, actual = self.regressor.detect_anomaly(data)
                 self.last_diff = diff
+                self.predicted_temp = predicted
 
                 # Update icon
                 self.update_icon(is_anomaly)
@@ -168,9 +176,15 @@ class TrayMonitor:
     def get_status_text(self):
         """Get current status as text."""
         status = "Paused" if self.paused else "Monitoring"
+        # Calculate absolute temperature thresholds
+        low_temp = self.predicted_temp + self.low_threshold if self.predicted_temp else 0.0
+        high_temp = self.predicted_temp + self.high_threshold if self.predicted_temp else 0.0
         return (f"Status: {status}\n"
                 f"CPU Temp: {self.current_temp:.1f}°C\n"
-                f"Last Diff: {self.last_diff:+.1f}°C\n"
+                f"Predicted: {self.predicted_temp:.1f}°C\n"
+                f"Diff: {self.last_diff:+.1f}°C\n"
+                f"Temp Range: [{low_temp:.1f}, {high_temp:.1f}]°C\n"
+                f"Diff Range: [{self.low_threshold:.1f}, {self.high_threshold:+.1f}]°C\n"
                 f"Anomalies: {self.anomaly_count}")
 
     def create_menu(self):
@@ -198,7 +212,12 @@ class TrayMonitor:
                 "Status",
                 pystray.Menu(
                     pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
+                    pystray.MenuItem(lambda text: f"Predicted: {self.predicted_temp:.1f}°C", None, enabled=False),
                     pystray.MenuItem(lambda text: f"Diff: {self.last_diff:+.1f}°C", None, enabled=False),
+                    pystray.Menu.SEPARATOR,
+                    pystray.MenuItem(lambda text: f"Range: [{(self.predicted_temp or 0) + (self.low_threshold or 0):.1f}, {(self.predicted_temp or 0) + (self.high_threshold or 0):.1f}]°C", None, enabled=False),
+                    pystray.MenuItem(lambda text: f"Diff Range: [{(self.low_threshold or 0):.1f}, {(self.high_threshold or 0):+.1f}]°C", None, enabled=False),
+                    pystray.Menu.SEPARATOR,
                     pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
                 )
             ),

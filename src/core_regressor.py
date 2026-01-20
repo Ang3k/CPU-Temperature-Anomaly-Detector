@@ -233,6 +233,18 @@ class CoreTempRegressor:
             'std_multiplier': self.threshold_std
         }
 
+    def recalculate_thresholds(self, threshold_std: float):
+        """Recalculate thresholds with new std multiplier without retraining."""
+        if self.y_test is None or self.y_pred is None:
+            raise ValueError("Model must be trained before recalculating thresholds")
+
+        self.threshold_std = threshold_std
+        diff = self.y_test.values - self.y_pred
+        mean_diff = np.mean(diff)
+        std_diff = np.std(diff)
+        self.low_threshold = mean_diff - threshold_std * std_diff
+        self.high_threshold = mean_diff + threshold_std * std_diff
+
     def init_realtime_buffer(self):
         """Initialize the buffer for real-time anomaly detection."""
         max_window = max(self.rolling_windows) if self.rolling_windows else 7

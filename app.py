@@ -142,6 +142,19 @@ class CPUTempMonitorApp:
                                     textvariable=self.interval_var, width=10)
         interval_spin.grid(row=1, column=1, pady=2, padx=5)
 
+        # Training data management
+        data_frame = ttk.LabelFrame(frame, text="Training Data", padding=10)
+        data_frame.pack(fill='x', padx=10, pady=5)
+
+        data_btn_frame = ttk.Frame(data_frame)
+        data_btn_frame.pack(fill='x')
+
+        self.save_data_btn = ttk.Button(data_btn_frame, text="Save Training Data", command=self.save_training_data, state='disabled')
+        self.save_data_btn.pack(side='left', padx=5)
+
+        self.load_data_btn = ttk.Button(data_btn_frame, text="Load Training Data", command=self.load_training_data)
+        self.load_data_btn.pack(side='left', padx=5)
+
         # Progress
         progress_frame = ttk.LabelFrame(frame, text="Progress", padding=10)
         progress_frame.pack(fill='x', padx=10, pady=5)
@@ -196,6 +209,9 @@ class CPUTempMonitorApp:
         threshold_spin = ttk.Spinbox(model_frame, from_=0.5, to=5.0, increment=0.1,
                                      textvariable=self.threshold_var, width=10)
         threshold_spin.grid(row=1, column=1, pady=2, padx=5, sticky='w')
+
+        self.apply_threshold_btn = ttk.Button(model_frame, text="Apply Threshold", command=self.apply_threshold, state='disabled')
+        self.apply_threshold_btn.grid(row=1, column=2, pady=2, padx=5)
 
         # Status
         status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
@@ -323,6 +339,7 @@ class CPUTempMonitorApp:
                 self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
                 self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
                 self.root.after(0, lambda: self.save_btn.config(state='normal'))
+                self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
 
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Training failed: {e}"))
@@ -373,6 +390,105 @@ class CPUTempMonitorApp:
             self.config.set('model_path', path)
             self.config.save()
 
+    def save_training_data(self):
+        """Save the collected training data to CSV."""
+        if not self.regressor or self.regressor.data is None or len(self.regressor.data) == 0:
+            messagebox.showwarning("Warning", "No training data to save")
+            return
+
+        # Ensure directory exists
+        os.makedirs('data', exist_ok=True)
+
+        # Generate filename with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"training_data_{timestamp}.csv"
+
+        path = filedialog.asksaveasfilename(
+            initialdir='data',
+            initialfile=default_name,
+            title="Save Training Data",
+            filetypes=[("CSV files", "*.csv")],
+            defaultextension=".csv"
+        )
+
+        if path:
+            self.regressor.data.to_csv(path, index=False)
+            messagebox.showinfo("Success", f"Training data saved to:\n{path}\n\n{len(self.regressor.data)} rows saved")
+
+    def load_training_data(self):
+        """Load training data from CSV and train model."""
+        path = filedialog.askopenfilename(
+            initialdir='data' if os.path.exists('data') else '.',
+            title="Load Training Data",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+
+        if not path:
+            return
+
+        try:
+            # Create regressor if not exists
+            if not self.regressor:
+                self.regressor = CoreTempRegressor()
+
+            # Configure model
+            self.regressor.configure_model(
+                model=self.model_type_var.get(),
+                scaler=self.scaler_var.get(),
+                use_time_features=True
+            )
+
+            # Load data from CSV
+            import pandas as pd
+            self.regressor.data = pd.read_csv(path)
+
+            # Convert timestamp if present
+            if 'timestamp' in self.regressor.data.columns:
+                self.regressor.data['timestamp'] = pd.to_datetime(self.regressor.data['timestamp'])
+
+            rows = len(self.regressor.data)
+
+            # Ask if should train immediately
+            should_train = messagebox.askyesno(
+                "Data Loaded",
+                f"Loaded {rows} rows from:\n{path}\n\nTrain model with this data now?"
+            )
+
+            if should_train:
+                self.progress_label.config(text=f"Training with {rows} rows...")
+                self.progress_var.set(50)
+
+                # Train in thread to avoid blocking UI
+                def train_loaded_data():
+                    try:
+                        self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                        # Show metrics
+                        metrics = self.regressor.evaluate_metrics()
+                        metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
+                                       f"MAE: {metrics['mae']:.2f}\n"
+                                       f"R2: {metrics['r2']:.3f}\n"
+                                       f"MAPE: {metrics['mape']:.1f}%")
+
+                        self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
+                        self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
+                        self.root.after(0, lambda: self.progress_var.set(100))
+                        self.root.after(0, lambda: self.save_btn.config(state='normal'))
+                        self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
+
+                    except Exception as e:
+                        self.root.after(0, lambda: messagebox.showerror("Error", f"Training failed: {e}"))
+                        self.root.after(0, lambda: self.progress_label.config(text="Training failed"))
+
+                threading.Thread(target=train_loaded_data, daemon=True).start()
+            else:
+                self.progress_label.config(text=f"Loaded {rows} rows - ready to train")
+                self.save_data_btn.config(state='normal')
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load data:\n{e}")
+
     def start_monitoring(self):
         """Start the monitoring process."""
         model_path = self.model_path_var.get()
@@ -395,6 +511,7 @@ class CPUTempMonitorApp:
             self.monitor_btn.config(state='disabled')
             self.stop_monitor_btn.config(state='normal')
             self.minimize_btn.config(state='normal')
+            self.apply_threshold_btn.config(state='normal')
 
             # Update status periodically
             self.update_status()
@@ -430,11 +547,38 @@ class CPUTempMonitorApp:
         self.monitor_btn.config(state='normal')
         self.stop_monitor_btn.config(state='disabled')
         self.minimize_btn.config(state='disabled')
+        self.apply_threshold_btn.config(state='disabled')
 
         self.status_text.config(state='normal')
         self.status_text.delete(1.0, tk.END)
         self.status_text.insert(tk.END, "Monitoring stopped")
         self.status_text.config(state='disabled')
+
+    def apply_threshold(self):
+        """Apply new threshold to running monitor."""
+        if not self.tray_monitor or not self.tray_monitor.regressor:
+            messagebox.showwarning("Warning", "No model loaded")
+            return
+
+        try:
+            new_threshold = self.threshold_var.get()
+
+            # Recalculate thresholds in the model
+            self.tray_monitor.regressor.recalculate_thresholds(new_threshold)
+
+            # Update tray monitor's cached thresholds
+            self.tray_monitor.low_threshold = self.tray_monitor.regressor.low_threshold
+            self.tray_monitor.high_threshold = self.tray_monitor.regressor.high_threshold
+
+            # Update status display
+            self.update_status()
+
+            messagebox.showinfo("Success",
+                f"Threshold updated to {new_threshold:.1f} std\n"
+                f"New diff range: [{self.tray_monitor.low_threshold:.1f}, {self.tray_monitor.high_threshold:+.1f}]°C")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to apply threshold:\n{e}")
 
     def minimize_to_tray(self):
         """Minimize the window to system tray."""
