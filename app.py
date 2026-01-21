@@ -6,6 +6,7 @@ GUI for training models and monitoring CPU temperature anomalies.
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -16,6 +17,15 @@ from src.core_regressor import CoreTempRegressor
 from src.tray_monitor import TrayMonitor
 from src.cpu_temp_bundled import HardwareMonitor
 
+import pystray
+from PIL import Image, ImageDraw
+
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from collections import deque
+
 
 class ConfigManager:
     """Manage application configuration."""
@@ -25,10 +35,11 @@ class ConfigManager:
         'threshold_std': 1.5,
         'check_interval': 5,
         'notifications_enabled': True,
-        'minimize_to_tray': True,
         'last_model_type': 'lightgbm',
         'last_scaler': 'standard',
         'multi_variable': True,
+        'collect_data_on_monitor': False,
+        'collection_interval': 5.0,
         'training_iterations': 1000,
         'training_interval': 1
     }
@@ -69,7 +80,7 @@ class CPUTempMonitorApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("CPU Temperature Monitor")
-        self.root.geometry("550x600")
+        self.root.geometry("600x800")
         self.root.resizable(True, True)
 
         # Config
@@ -81,6 +92,24 @@ class CPUTempMonitorApp:
         self.training_thread = None
         self.is_training = False
         self.is_monitoring = False
+
+        # Data collection state
+        self.is_collecting = False
+        self.collection_thread = None
+        self.collected_background_data = []
+        self.collection_time_counter = 0
+
+        # Simple tray icon (when not monitoring)
+        self.simple_tray_icon = None
+        self.simple_tray_thread = None
+
+        # Graph data history (for real-time plotting)
+        self.graph_max_points = 100  # Show last 100 points
+        self.graph_times = deque(maxlen=self.graph_max_points)
+        self.graph_actual = deque(maxlen=self.graph_max_points)
+        self.graph_predicted = deque(maxlen=self.graph_max_points)
+        self.graph_diff = deque(maxlen=self.graph_max_points)
+        self.graph_counter = 0
 
         # Setup UI
         self.setup_ui()
@@ -193,16 +222,70 @@ class CPUTempMonitorApp:
         interval_spin.grid(row=1, column=1, pady=2, padx=5)
 
         # Training data management
-        data_frame = ttk.LabelFrame(frame, text="Training Data", padding=10)
+        data_frame = ttk.LabelFrame(frame, text="Training Data Collection", padding=10)
         data_frame.pack(fill='x', padx=10, pady=5)
 
-        data_btn_frame = ttk.Frame(data_frame)
-        data_btn_frame.pack(fill='x')
+        # Background auto-collection
+        ttk.Label(data_frame, text="Background Data Collection:",
+                 font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', pady=(0, 5))
 
-        self.save_data_btn = ttk.Button(data_btn_frame, text="Save Training Data", command=self.save_training_data, state='disabled')
+        ttk.Label(data_frame,
+                 text="Continuously collect sensor data in background. Leave running for hours/days.",
+                 font=('TkDefaultFont', 8),
+                 foreground='gray').pack(anchor='w', pady=(0, 5))
+
+        # Collection interval
+        interval_frame = ttk.Frame(data_frame)
+        interval_frame.pack(fill='x', pady=(0, 5))
+
+        ttk.Label(interval_frame, text="Collection Interval (s):").pack(side='left', padx=(0, 5))
+        self.collection_interval_var = tk.DoubleVar(value=self.config.get('collection_interval', 5.0))
+        interval_spin = ttk.Spinbox(interval_frame, from_=1, to=60, increment=1,
+                                    textvariable=self.collection_interval_var, width=10)
+        interval_spin.pack(side='left')
+
+        # Collection status
+        self.collection_status_label = ttk.Label(data_frame, text="Not collecting", foreground='gray')
+        self.collection_status_label.pack(anchor='w', pady=5)
+
+        # Collection control buttons
+        collection_ctrl_frame = ttk.Frame(data_frame)
+        collection_ctrl_frame.pack(fill='x', pady=(0, 10))
+
+        self.start_collection_btn = ttk.Button(collection_ctrl_frame, text="Start Collection",
+                                               command=self.start_background_collection)
+        self.start_collection_btn.pack(side='left', padx=5)
+
+        self.stop_collection_btn = ttk.Button(collection_ctrl_frame, text="Stop Collection",
+                                              command=self.stop_background_collection, state='disabled')
+        self.stop_collection_btn.pack(side='left', padx=5)
+
+        # Save/Clear collected data
+        data_mgmt_frame = ttk.Frame(data_frame)
+        data_mgmt_frame.pack(fill='x', pady=(0, 10))
+
+        self.save_collected_btn = ttk.Button(data_mgmt_frame, text="Save Collected Data",
+                                             command=self.save_background_collected_data, state='disabled')
+        self.save_collected_btn.pack(side='left', padx=5)
+
+        self.clear_collected_btn = ttk.Button(data_mgmt_frame, text="Clear Collected Data",
+                                              command=self.clear_background_collected_data, state='disabled')
+        self.clear_collected_btn.pack(side='left', padx=5)
+
+        # Separator
+        ttk.Separator(data_frame, orient='horizontal').pack(fill='x', pady=10)
+
+        # Manual training data buttons
+        ttk.Label(data_frame, text="Manual Training Data:",
+                 font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', pady=(0, 5))
+
+        manual_data_frame = ttk.Frame(data_frame)
+        manual_data_frame.pack(fill='x')
+
+        self.save_data_btn = ttk.Button(manual_data_frame, text="Save Training Data", command=self.save_training_data, state='disabled')
         self.save_data_btn.pack(side='left', padx=5)
 
-        self.load_data_btn = ttk.Button(data_btn_frame, text="Load Training Data", command=self.load_training_data)
+        self.load_data_btn = ttk.Button(manual_data_frame, text="Load Training Data", command=self.load_training_data)
         self.load_data_btn.pack(side='left', padx=5)
 
         # Progress
@@ -263,16 +346,17 @@ class CPUTempMonitorApp:
         self.apply_threshold_btn = ttk.Button(model_frame, text="Apply Threshold", command=self.apply_threshold, state='disabled')
         self.apply_threshold_btn.grid(row=1, column=2, pady=2, padx=5)
 
-        # Status
-        status_frame = ttk.LabelFrame(frame, text="Status", padding=10)
-        status_frame.pack(fill='x', padx=10, pady=5)
-
-        self.status_text = tk.Text(status_frame, height=8, width=50, state='disabled')
-        self.status_text.pack(fill='x', pady=5)
+        # Monitor data collection option
+        ttk.Label(model_frame, text="").grid(row=2, column=0, pady=2)  # Spacer
+        self.collect_data_var = tk.BooleanVar(value=self.config.get('collect_data_on_monitor', False))
+        collect_check = ttk.Checkbutton(model_frame,
+                                        text="Also collect data during monitoring",
+                                        variable=self.collect_data_var)
+        collect_check.grid(row=3, column=0, columnspan=3, sticky='w', pady=2)
 
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill='x', padx=10, pady=10)
+        btn_frame.pack(fill='x', padx=10, pady=5)
 
         self.monitor_btn = ttk.Button(btn_frame, text="Start Monitoring", command=self.start_monitoring)
         self.monitor_btn.pack(side='left', padx=5)
@@ -282,6 +366,48 @@ class CPUTempMonitorApp:
 
         self.minimize_btn = ttk.Button(btn_frame, text="Minimize to Tray", command=self.minimize_to_tray, state='disabled')
         self.minimize_btn.pack(side='left', padx=5)
+
+        # Real-time Graph
+        graph_frame = ttk.LabelFrame(frame, text="Real-time Temperature Graph", padding=5)
+        graph_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+        # Create matplotlib figure with 2 subplots
+        self.fig = Figure(figsize=(6, 4), dpi=80)
+        self.fig.set_facecolor('#f0f0f0')
+
+        # Subplot 1: Actual vs Predicted Temperature
+        self.ax1 = self.fig.add_subplot(211)
+        self.ax1.set_ylabel('Temperature (°C)')
+        self.ax1.set_title('Actual vs Predicted', fontsize=9)
+        self.ax1.grid(True, alpha=0.3)
+        self.line_actual, = self.ax1.plot([], [], 'b-', label='Actual', linewidth=1.5)
+        self.line_predicted, = self.ax1.plot([], [], 'r--', label='Predicted', linewidth=1.5)
+        self.ax1.legend(loc='upper left', fontsize=8)
+
+        # Subplot 2: Difference with Thresholds
+        self.ax2 = self.fig.add_subplot(212)
+        self.ax2.set_xlabel('Time')
+        self.ax2.set_ylabel('Diff (°C)')
+        self.ax2.set_title('Prediction Error (Diff)', fontsize=9)
+        self.ax2.grid(True, alpha=0.3)
+        self.line_diff, = self.ax2.plot([], [], 'orange', label='Diff', linewidth=1.5)
+        self.line_low_thresh = self.ax2.axhline(y=0, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label='Low')
+        self.line_high_thresh = self.ax2.axhline(y=0, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label='High')
+        self.ax2.legend(loc='upper left', fontsize=8)
+
+        self.fig.tight_layout()
+
+        # Embed in tkinter
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        # Status (compact)
+        status_frame = ttk.LabelFrame(frame, text="Status", padding=5)
+        status_frame.pack(fill='x', padx=10, pady=5)
+
+        self.status_text = tk.Text(status_frame, height=5, width=50, state='disabled', font=('Consolas', 9))
+        self.status_text.pack(fill='x', pady=2)
 
     def setup_settings_tab(self):
         """Setup the settings tab."""
@@ -302,10 +428,10 @@ class CPUTempMonitorApp:
                                       variable=self.notifications_var)
         notif_check.grid(row=1, column=0, columnspan=2, sticky='w', pady=5)
 
-        self.minimize_var = tk.BooleanVar(value=self.config.get('minimize_to_tray', True))
-        minimize_check = ttk.Checkbutton(general_frame, text="Minimize to Tray on Close",
-                                         variable=self.minimize_var)
-        minimize_check.grid(row=2, column=0, columnspan=2, sticky='w', pady=5)
+        ttk.Label(general_frame,
+                 text="Note: App ALWAYS minimizes to tray (never closes from X button).\nEverything continues running in background (training, collection, monitoring).",
+                 font=('TkDefaultFont', 8),
+                 foreground='gray').grid(row=2, column=0, columnspan=2, sticky='w', pady=5)
 
         # Save button
         save_frame = ttk.Frame(frame)
@@ -319,10 +445,11 @@ class CPUTempMonitorApp:
         info_frame.pack(fill='x', padx=10, pady=5)
 
         info_text = ("CPU Temperature Monitor\n\n"
-                     "1. Train a model using your CPU data\n"
-                     "2. Save the trained model\n"
-                     "3. Start monitoring to detect anomalies\n"
-                     "4. Minimize to system tray for background monitoring")
+                     "1. Train, collect data, or monitor\n"
+                     "2. Close window (X) → minimizes to tray\n"
+                     "3. Everything keeps running in background!\n"
+                     "4. Click tray icon to reopen window\n"
+                     "5. To quit: use tray menu 'Quit'")
         ttk.Label(info_frame, text=info_text, justify='left').pack()
 
     def browse_model(self):
@@ -550,12 +677,19 @@ class CPUTempMonitorApp:
             return
 
         try:
+            # Stop simple tray icon if exists (monitoring has its own tray)
+            if self.simple_tray_icon:
+                self.simple_tray_icon.stop()
+                self.simple_tray_icon = None
+
             self.tray_monitor = TrayMonitor(
                 model_path=model_path,
                 check_interval=self.check_interval_var.get(),
                 threshold_std=self.threshold_var.get(),
                 notifications_enabled=self.notifications_var.get(),
-                on_open_gui=self.show_window
+                on_open_gui=self.show_window,
+                on_quit_app=self.quit_application,
+                collect_data=self.collect_data_var.get()
             )
             self.tray_monitor.load_model()
             self.tray_monitor.start_monitoring()
@@ -576,18 +710,90 @@ class CPUTempMonitorApp:
             messagebox.showerror("Error", f"Failed to start monitoring: {e}")
 
     def update_status(self):
-        """Update the status display."""
+        """Update the status display and graph."""
         if not self.is_monitoring or not self.tray_monitor:
             return
 
+        # Update text status
         status = self.tray_monitor.get_status_text()
         self.status_text.config(state='normal')
         self.status_text.delete(1.0, tk.END)
         self.status_text.insert(tk.END, status)
         self.status_text.config(state='disabled')
 
+        # Update graph data
+        if self.tray_monitor.current_temp > 0:
+            self.graph_times.append(self.graph_counter)
+            self.graph_actual.append(self.tray_monitor.current_temp)
+            self.graph_predicted.append(self.tray_monitor.predicted_temp)
+            self.graph_diff.append(self.tray_monitor.last_diff)
+            self.graph_counter += 1
+
+            # Update graph
+            self.update_graph()
+
         # Schedule next update
         self.root.after(1000, self.update_status)
+
+    def update_graph(self):
+        """Update the real-time matplotlib graph."""
+        if not self.graph_times:
+            return
+
+        times = list(self.graph_times)
+        actual = list(self.graph_actual)
+        predicted = list(self.graph_predicted)
+        diff = list(self.graph_diff)
+
+        # Update subplot 1: Actual vs Predicted
+        self.line_actual.set_data(times, actual)
+        self.line_predicted.set_data(times, predicted)
+
+        # Adjust axes for subplot 1
+        if times:
+            self.ax1.set_xlim(min(times), max(times) + 1)
+            all_temps = actual + predicted
+            if all_temps:
+                min_temp = min(all_temps) - 2
+                max_temp = max(all_temps) + 2
+                self.ax1.set_ylim(min_temp, max_temp)
+
+        # Update subplot 2: Diff with Thresholds
+        self.line_diff.set_data(times, diff)
+
+        # Update threshold lines
+        if self.tray_monitor:
+            low_thresh = self.tray_monitor.low_threshold or 0.0
+            high_thresh = self.tray_monitor.high_threshold or 0.0
+            self.line_low_thresh.set_ydata([float(low_thresh), float(low_thresh)])
+            self.line_high_thresh.set_ydata([float(high_thresh), float(high_thresh)])
+
+        # Adjust axes for subplot 2
+        if times:
+            self.ax2.set_xlim(min(times), max(times) + 1)
+            if diff:
+                low_thresh = float(self.tray_monitor.low_threshold or 0) if self.tray_monitor else 0.0
+                high_thresh = float(self.tray_monitor.high_threshold or 0) if self.tray_monitor else 0.0
+                min_diff = min(min(diff), low_thresh) - 1
+                max_diff = max(max(diff), high_thresh) + 1
+                self.ax2.set_ylim(min_diff, max_diff)
+
+        # Redraw canvas
+        self.canvas.draw_idle()
+
+    def clear_graph(self):
+        """Clear the graph data."""
+        self.graph_times.clear()
+        self.graph_actual.clear()
+        self.graph_predicted.clear()
+        self.graph_diff.clear()
+        self.graph_counter = 0
+
+        # Clear plot lines
+        self.line_actual.set_data([], [])
+        self.line_predicted.set_data([], [])
+        self.line_diff.set_data([], [])
+        self.canvas.draw_idle()
 
     def stop_monitoring(self):
         """Stop the monitoring process."""
@@ -606,6 +812,113 @@ class CPUTempMonitorApp:
         self.status_text.delete(1.0, tk.END)
         self.status_text.insert(tk.END, "Monitoring stopped")
         self.status_text.config(state='disabled')
+
+        # Clear graph for next session
+        self.clear_graph()
+
+        # If window is minimized, create simple tray icon
+        if not self.root.winfo_viewable():
+            self.create_simple_tray()
+
+    def start_background_collection(self):
+        """Start background data collection without monitoring."""
+        if self.is_collecting:
+            return
+
+        self.is_collecting = True
+        self.start_collection_btn.config(state='disabled')
+        self.stop_collection_btn.config(state='normal')
+        self.save_collected_btn.config(state='normal')
+        self.clear_collected_btn.config(state='normal')
+
+        def collection_loop():
+            from datetime import datetime
+            from src.cpu_temp_bundled import HardwareMonitor
+
+            monitor = HardwareMonitor()
+            interval = self.collection_interval_var.get()
+
+            while self.is_collecting:
+                try:
+                    # Get sensor data
+                    data = monitor.get_essential_fast()
+                    data['timestamp'] = datetime.now()
+                    data['time'] = self.collection_time_counter
+                    self.collected_background_data.append(data)
+                    self.collection_time_counter += 1
+
+                    # Update status
+                    self.root.after(0, lambda: self.collection_status_label.config(
+                        text=f"Collecting... {len(self.collected_background_data)} samples",
+                        foreground='green'
+                    ))
+
+                except Exception as e:
+                    print(f"Collection error: {e}")
+
+                time.sleep(interval)
+
+            # Cleanup
+            monitor.close()
+            self.root.after(0, lambda: self.collection_status_label.config(
+                text=f"Stopped - {len(self.collected_background_data)} samples collected",
+                foreground='orange'
+            ))
+
+        self.collection_thread = threading.Thread(target=collection_loop, daemon=True)
+        self.collection_thread.start()
+
+    def stop_background_collection(self):
+        """Stop background data collection."""
+        self.is_collecting = False
+        self.start_collection_btn.config(state='normal')
+        self.stop_collection_btn.config(state='disabled')
+
+    def save_background_collected_data(self):
+        """Save background collected data to CSV."""
+        if not self.collected_background_data:
+            messagebox.showwarning("Warning", "No collected data to save")
+            return
+
+        # Ensure directory exists
+        os.makedirs('data', exist_ok=True)
+
+        # Generate filename with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"background_data_{timestamp}.csv"
+
+        path = filedialog.asksaveasfilename(
+            initialdir='data',
+            initialfile=default_name,
+            title="Save Background Collected Data",
+            filetypes=[("CSV files", "*.csv")],
+            defaultextension=".csv"
+        )
+
+        if path:
+            import pandas as pd
+            df = pd.DataFrame(self.collected_background_data)
+            df.to_csv(path, index=False)
+            messagebox.showinfo("Success",
+                f"Background data saved to:\n{path}\n\n"
+                f"{len(self.collected_background_data)} samples saved")
+
+    def clear_background_collected_data(self):
+        """Clear background collected data."""
+        if self.collected_background_data:
+            result = messagebox.askyesno(
+                "Clear Data",
+                f"Are you sure you want to clear {len(self.collected_background_data)} collected samples?\n\n"
+                "This cannot be undone!"
+            )
+            if result:
+                self.collected_background_data = []
+                self.collection_time_counter = 0
+                self.collection_status_label.config(text="Not collecting", foreground='gray')
+                messagebox.showinfo("Cleared", "Collected data has been cleared")
+        else:
+            messagebox.showinfo("Info", "No collected data to clear")
 
     def apply_threshold(self):
         """Apply new threshold to running monitor."""
@@ -637,34 +950,130 @@ class CPUTempMonitorApp:
         """Minimize the window to system tray."""
         self.root.withdraw()
 
+        # If no tray monitor exists (not monitoring), create a simple tray icon
+        if not self.tray_monitor:
+            self.create_simple_tray()
+
     def show_window(self):
         """Show the window from tray."""
+        # Stop simple tray icon if it exists (not needed when window is visible)
+        if self.simple_tray_icon:
+            self.simple_tray_icon.stop()
+            self.simple_tray_icon = None
+
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+
+    def create_simple_tray_icon(self):
+        """Create a simple colored circle icon for tray."""
+        size = 64
+        image = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+
+        # Determine color based on state
+        if self.is_training:
+            color = '#3b82f6'  # Blue - training
+        elif self.is_collecting:
+            color = '#10b981'  # Green - collecting
+        else:
+            color = '#6b7280'  # Gray - idle
+
+        # Draw circle
+        margin = 4
+        draw.ellipse([margin, margin, size - margin, size - margin], fill=color)
+
+        # Draw thermometer shape inside
+        center_x, center_y = size // 2, size // 2
+        draw.ellipse([center_x - 8, center_y + 8, center_x + 8, center_y + 20], fill='white')
+        draw.rectangle([center_x - 4, center_y - 16, center_x + 4, center_y + 12], fill='white')
+        draw.ellipse([center_x - 6, center_y - 18, center_x + 6, center_y - 12], fill='white')
+
+        return image
+
+    def create_simple_tray(self):
+        """Create simple tray icon when not monitoring."""
+        if self.simple_tray_icon:
+            return  # Already exists
+
+        def on_open(icon, item):
+            self.show_window()
+
+        def on_quit(icon, item):
+            icon.stop()
+            self.quit_application()
+
+        # Get status text
+        status_lines = []
+        if self.is_training:
+            status_lines.append("Training in progress...")
+        if self.is_collecting:
+            status_lines.append(f"Collecting: {len(self.collected_background_data)} samples")
+        if not status_lines:
+            status_lines.append("Idle - Click to open")
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Open GUI", on_open, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda text: status_lines[0], None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", on_quit)
+        )
+
+        self.simple_tray_icon = pystray.Icon(
+            "cpu_temp_monitor",
+            self.create_simple_tray_icon(),
+            "CPU Temp Monitor",
+            menu=menu
+        )
+
+        # Run in background thread
+        def run_tray():
+            self.simple_tray_icon.run()
+
+        self.simple_tray_thread = threading.Thread(target=run_tray, daemon=True)
+        self.simple_tray_thread.start()
+
+    def quit_application(self):
+        """Completely quit the application."""
+        # Stop any active processes
+        if self.is_training:
+            self.is_training = False
+        if self.is_collecting:
+            self.is_collecting = False
+
+        # Stop tray icons
+        if self.simple_tray_icon:
+            self.simple_tray_icon.stop()
+        if self.tray_monitor:
+            self.tray_monitor.stop_tray()
+
+        # Destroy the window (will close the app)
+        self.root.quit()
+        self.root.destroy()
 
     def save_settings(self):
         """Save current settings to config file."""
         self.config.set('check_interval', self.check_interval_var.get())
         self.config.set('notifications_enabled', self.notifications_var.get())
-        self.config.set('minimize_to_tray', self.minimize_var.get())
         self.config.set('threshold_std', self.threshold_var.get())
         self.config.set('multi_variable', self.multi_variable_var.get())
+        self.config.set('collect_data_on_monitor', self.collect_data_var.get())
+        self.config.set('collection_interval', self.collection_interval_var.get())
         self.config.set('training_iterations', self.iterations_var.get())
         self.config.set('training_interval', self.interval_var.get())
         self.config.save()
         messagebox.showinfo("Settings", "Settings saved successfully")
 
     def on_close(self):
-        """Handle window close event."""
-        if self.minimize_var.get() and self.is_monitoring:
-            self.minimize_to_tray()
-        else:
-            if self.is_monitoring:
-                self.stop_monitoring()
-            if self.is_training:
-                self.is_training = False
-            self.root.destroy()
+        """Handle window close event - ALWAYS minimize to tray, never close."""
+        # Always minimize to tray - everything keeps running in background
+        self.minimize_to_tray()
+
+        # Show notification if first time
+        if not hasattr(self, '_tray_notification_shown'):
+            self._tray_notification_shown = True
+            # Could show a system notification here if needed
 
     def run(self):
         """Run the application."""

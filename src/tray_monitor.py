@@ -46,12 +46,14 @@ class TrayMonitor:
 
     def __init__(self, model_path: str = None, check_interval: float = 5.0,
                  threshold_std: float = 1.5, notifications_enabled: bool = True,
-                 on_open_gui=None):
+                 on_open_gui=None, on_quit_app=None, collect_data: bool = False):
         self.model_path = model_path
         self.check_interval = check_interval
         self.threshold_std = threshold_std
         self.notifications_enabled = notifications_enabled
         self.on_open_gui = on_open_gui
+        self.on_quit_app = on_quit_app
+        self.collect_data = collect_data
 
         self.regressor = None
         self.monitor = None
@@ -68,6 +70,10 @@ class TrayMonitor:
         self.last_anomaly_time = None
         self.low_threshold = 0.0
         self.high_threshold = 0.0
+
+        # Background data collection
+        self.collected_data = []
+        self.time_counter = 0
 
     def load_model(self, path: str = None):
         """Load the trained model."""
@@ -105,6 +111,7 @@ class TrayMonitor:
 
     def monitor_loop(self):
         """Main monitoring loop running in background thread."""
+        from datetime import datetime
         self.monitor = HardwareMonitor()
 
         while self.running:
@@ -116,6 +123,14 @@ class TrayMonitor:
                 # Get current sensor data
                 data = self.monitor.get_essential_fast()
                 self.current_temp = data.get('cpu_temp', 0.0)
+
+                # Collect data in background if enabled
+                if self.collect_data:
+                    data_point = data.copy()
+                    data_point['timestamp'] = datetime.now()
+                    data_point['time'] = self.time_counter
+                    self.collected_data.append(data_point)
+                    self.time_counter += 1
 
                 # Detect anomaly
                 is_anomaly, diff, predicted, actual = self.regressor.detect_anomaly(data)
@@ -179,13 +194,39 @@ class TrayMonitor:
         # Calculate absolute temperature thresholds
         low_temp = self.predicted_temp + self.low_threshold if self.predicted_temp else 0.0
         high_temp = self.predicted_temp + self.high_threshold if self.predicted_temp else 0.0
-        return (f"Status: {status}\n"
-                f"CPU Temp: {self.current_temp:.1f}°C\n"
-                f"Predicted: {self.predicted_temp:.1f}°C\n"
-                f"Diff: {self.last_diff:+.1f}°C\n"
-                f"Temp Range: [{low_temp:.1f}, {high_temp:.1f}]°C\n"
-                f"Diff Range: [{self.low_threshold:.1f}, {self.high_threshold:+.1f}]°C\n"
-                f"Anomalies: {self.anomaly_count}")
+
+        status_text = (f"Status: {status}\n"
+                       f"CPU Temp: {self.current_temp:.1f}°C\n"
+                       f"Predicted: {self.predicted_temp:.1f}°C\n"
+                       f"Diff: {self.last_diff:+.1f}°C\n"
+                       f"Temp Range: [{low_temp:.1f}, {high_temp:.1f}]°C\n"
+                       f"Diff Range: [{self.low_threshold:.1f}, {self.high_threshold:+.1f}]°C\n"
+                       f"Anomalies: {self.anomaly_count}")
+
+        if self.collect_data:
+            status_text += f"\nCollected Data: {len(self.collected_data)} samples"
+
+        return status_text
+
+    def save_collected_data(self, filepath: str):
+        """Save collected data to CSV file."""
+        import pandas as pd
+        if not self.collected_data:
+            return False
+
+        df = pd.DataFrame(self.collected_data)
+        df.to_csv(filepath, index=False)
+        return True
+
+    def clear_collected_data(self):
+        """Clear collected data and reset counter."""
+        self.collected_data = []
+        self.time_counter = 0
+
+    def toggle_data_collection(self):
+        """Toggle background data collection on/off."""
+        self.collect_data = not self.collect_data
+        return self.collect_data
 
     def create_menu(self):
         """Create the system tray menu."""
@@ -198,29 +239,51 @@ class TrayMonitor:
             # Update menu item text
             self.icon.menu = self.create_menu()
 
+        def on_toggle_collection(icon, item):
+            self.toggle_data_collection()
+            # Update menu item text
+            self.icon.menu = self.create_menu()
+
         def on_quit(icon, item):
             self.stop_monitoring()
             icon.stop()
+            if self.on_quit_app:
+                self.on_quit_app()
 
         pause_text = "Resume" if self.paused else "Pause"
+        collection_text = "Stop Data Collection" if self.collect_data else "Start Data Collection"
+
+        status_menu = pystray.Menu(
+            pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
+            pystray.MenuItem(lambda text: f"Predicted: {self.predicted_temp:.1f}°C", None, enabled=False),
+            pystray.MenuItem(lambda text: f"Diff: {self.last_diff:+.1f}°C", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda text: f"Range: [{(self.predicted_temp or 0) + (self.low_threshold or 0):.1f}, {(self.predicted_temp or 0) + (self.high_threshold or 0):.1f}]°C", None, enabled=False),
+            pystray.MenuItem(lambda text: f"Diff Range: [{(self.low_threshold or 0):.1f}, {(self.high_threshold or 0):+.1f}]°C", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
+        )
+
+        # Add data collection info to status if enabled
+        if self.collect_data:
+            status_menu = pystray.Menu(
+                pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
+                pystray.MenuItem(lambda text: f"Predicted: {self.predicted_temp:.1f}°C", None, enabled=False),
+                pystray.MenuItem(lambda text: f"Diff: {self.last_diff:+.1f}°C", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(lambda text: f"Range: [{(self.predicted_temp or 0) + (self.low_threshold or 0):.1f}, {(self.predicted_temp or 0) + (self.high_threshold or 0):.1f}]°C", None, enabled=False),
+                pystray.MenuItem(lambda text: f"Diff Range: [{(self.low_threshold or 0):.1f}, {(self.high_threshold or 0):+.1f}]°C", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
+                pystray.MenuItem(lambda text: f"Collected: {len(self.collected_data)} samples", None, enabled=False),
+            )
 
         return pystray.Menu(
             pystray.MenuItem("Open GUI", on_open, default=True),
             pystray.MenuItem(pause_text, on_pause),
+            pystray.MenuItem(collection_text, on_toggle_collection),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                "Status",
-                pystray.Menu(
-                    pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
-                    pystray.MenuItem(lambda text: f"Predicted: {self.predicted_temp:.1f}°C", None, enabled=False),
-                    pystray.MenuItem(lambda text: f"Diff: {self.last_diff:+.1f}°C", None, enabled=False),
-                    pystray.Menu.SEPARATOR,
-                    pystray.MenuItem(lambda text: f"Range: [{(self.predicted_temp or 0) + (self.low_threshold or 0):.1f}, {(self.predicted_temp or 0) + (self.high_threshold or 0):.1f}]°C", None, enabled=False),
-                    pystray.MenuItem(lambda text: f"Diff Range: [{(self.low_threshold or 0):.1f}, {(self.high_threshold or 0):+.1f}]°C", None, enabled=False),
-                    pystray.Menu.SEPARATOR,
-                    pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
-                )
-            ),
+            pystray.MenuItem("Status", status_menu),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", on_quit)
         )
