@@ -92,12 +92,14 @@ class CPUTempMonitorApp:
         self.training_thread = None
         self.is_training = False
         self.is_monitoring = False
+        self.pc_info = None
 
         # Data collection state
         self.is_collecting = False
         self.collection_thread = None
         self.collected_background_data = []
         self.collection_time_counter = 0
+        self.training_data_df = None
 
         # Simple tray icon (when not monitoring)
         self.simple_tray_icon = None
@@ -304,8 +306,16 @@ class CPUTempMonitorApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill='x', padx=10, pady=10)
 
-        self.train_btn = ttk.Button(btn_frame, text="Start Training", command=self.start_training)
+        self.train_btn = ttk.Button(btn_frame, text="Collect + Train", command=self.start_training)
         self.train_btn.pack(side='left', padx=5)
+
+        self.train_from_data_btn = ttk.Button(
+            btn_frame,
+            text="Train From Data",
+            command=self.train_from_existing_data,
+            state='disabled'
+        )
+        self.train_from_data_btn.pack(side='left', padx=5)
 
         self.save_btn = ttk.Button(btn_frame, text="Save Model", command=self.save_model, state='disabled')
         self.save_btn.pack(side='left', padx=5)
@@ -413,6 +423,19 @@ class CPUTempMonitorApp:
         """Setup the settings tab."""
         frame = self.settings_tab['inner']
 
+        # Hardware Information
+        hw_frame = ttk.LabelFrame(frame, text="Hardware Information", padding=10)
+        hw_frame.pack(fill='x', padx=10, pady=5)
+
+        # Hardware info display
+        self.hw_info_text = tk.Text(hw_frame, height=6, width=50, state='disabled',
+                                     font=('Consolas', 9), background='#f8f9fa')
+        self.hw_info_text.pack(fill='x', pady=5)
+
+        # Button to detect hardware
+        detect_hw_btn = ttk.Button(hw_frame, text="Detect Hardware", command=self.detect_hardware)
+        detect_hw_btn.pack(pady=5)
+
         # General settings
         general_frame = ttk.LabelFrame(frame, text="General", padding=10)
         general_frame.pack(fill='x', padx=10, pady=5)
@@ -463,6 +486,14 @@ class CPUTempMonitorApp:
         if path:
             self.model_path_var.set(path)
 
+    def update_train_from_data_state(self):
+        """Enable/disable training from existing data based on availability."""
+        has_loaded = self.training_data_df is not None and len(self.training_data_df) > 0
+        has_collected = len(self.collected_background_data) > 0
+        state = 'normal' if (has_loaded or has_collected) else 'disabled'
+        if hasattr(self, 'train_from_data_btn'):
+            self.train_from_data_btn.config(state=state)
+
     def start_training(self):
         """Start the training process in a background thread."""
         if self.is_training:
@@ -470,6 +501,7 @@ class CPUTempMonitorApp:
 
         self.is_training = True
         self.train_btn.config(state='disabled')
+        self.train_from_data_btn.config(state='disabled')
         self.stop_train_btn.config(state='normal')
         self.save_btn.config(state='disabled')
         self.progress_var.set(0)
@@ -500,6 +532,11 @@ class CPUTempMonitorApp:
                     should_stop_callback=lambda: not self.is_training
                 )
 
+                if self.regressor.data is not None and len(self.regressor.data) > 0:
+                    self.training_data_df = self.regressor.data.copy()
+                    self.root.after(0, self.update_train_from_data_state)
+                    self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
+
                 if not self.is_training:  # Stopped
                     return
 
@@ -518,6 +555,7 @@ class CPUTempMonitorApp:
                 self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
                 self.root.after(0, lambda: self.save_btn.config(state='normal'))
                 self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
+                self.root.after(0, self.update_train_from_data_state)
 
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Training failed: {e}"))
@@ -526,10 +564,80 @@ class CPUTempMonitorApp:
             finally:
                 self.is_training = False
                 self.root.after(0, lambda: self.train_btn.config(state='normal'))
+                self.root.after(0, self.update_train_from_data_state)
                 self.root.after(0, lambda: self.stop_train_btn.config(state='disabled'))
 
         self.training_thread = threading.Thread(target=train_thread, daemon=True)
         self.training_thread.start()
+
+    def train_from_existing_data(self):
+        """Train a model using already collected or loaded data."""
+        if self.is_training:
+            return
+
+        data_df = self.training_data_df
+        if data_df is None or len(data_df) == 0:
+            if self.collected_background_data:
+                import pandas as pd
+                data_df = pd.DataFrame(list(self.collected_background_data))
+                self.training_data_df = data_df
+                self.update_train_from_data_state()
+            else:
+                messagebox.showwarning(
+                    "Warning",
+                    "No training data available.\n\nLoad data or collect samples first."
+                )
+                return
+
+        self.is_training = True
+        self.train_btn.config(state='disabled')
+        self.train_from_data_btn.config(state='disabled')
+        self.stop_train_btn.config(state='normal')
+        self.save_btn.config(state='disabled')
+        self.progress_var.set(0)
+        self.progress_label.config(text="Training model...")
+
+        def train_thread():
+            try:
+                self.regressor = CoreTempRegressor()
+                self.regressor.configure_model(
+                    model=self.model_type_var.get(),
+                    multi_variable=self.multi_variable_var.get(),
+                    scaler=self.scaler_var.get(),
+                    use_time_features=True
+                )
+
+                self.regressor.data = data_df.copy()
+                if 'timestamp' in self.regressor.data.columns:
+                    import pandas as pd
+                    self.regressor.data['timestamp'] = pd.to_datetime(self.regressor.data['timestamp'])
+
+                self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                metrics = self.regressor.evaluate_metrics()
+                metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
+                               f"MAE: {metrics['mae']:.2f}\n"
+                               f"R2: {metrics['r2']:.3f}\n"
+                               f"MAPE: {metrics['mape']:.1f}%")
+
+                self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
+                self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
+                self.root.after(0, lambda: self.progress_var.set(100))
+                self.root.after(0, lambda: self.save_btn.config(state='normal'))
+                self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
+                self.root.after(0, self.update_train_from_data_state)
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Training failed: {e}"))
+                self.root.after(0, lambda: self.progress_label.config(text="Training failed"))
+
+            finally:
+                self.is_training = False
+                self.root.after(0, lambda: self.train_btn.config(state='normal'))
+                self.root.after(0, self.update_train_from_data_state)
+                self.root.after(0, lambda: self.stop_train_btn.config(state='disabled'))
+
+        threading.Thread(target=train_thread, daemon=True).start()
 
     def stop_training(self):
         """Stop the training process."""
@@ -571,7 +679,13 @@ class CPUTempMonitorApp:
 
     def save_training_data(self):
         """Save the collected training data to CSV."""
-        if not self.regressor or self.regressor.data is None or len(self.regressor.data) == 0:
+        data_df = None
+        if self.training_data_df is not None and len(self.training_data_df) > 0:
+            data_df = self.training_data_df
+        elif self.regressor and self.regressor.data is not None and len(self.regressor.data) > 0:
+            data_df = self.regressor.data
+
+        if data_df is None:
             messagebox.showwarning("Warning", "No training data to save")
             return
 
@@ -592,8 +706,8 @@ class CPUTempMonitorApp:
         )
 
         if path:
-            self.regressor.data.to_csv(path, index=False)
-            messagebox.showinfo("Success", f"Training data saved to:\n{path}\n\n{len(self.regressor.data)} rows saved")
+            data_df.to_csv(path, index=False)
+            messagebox.showinfo("Success", f"Training data saved to:\n{path}\n\n{len(data_df)} rows saved")
 
     def load_training_data(self):
         """Load training data from CSV and train model."""
@@ -607,27 +721,17 @@ class CPUTempMonitorApp:
             return
 
         try:
-            # Create regressor if not exists
-            if not self.regressor:
-                self.regressor = CoreTempRegressor()
-
-            # Configure model
-            self.regressor.configure_model(
-                model=self.model_type_var.get(),
-                multi_variable=self.multi_variable_var.get(),
-                scaler=self.scaler_var.get(),
-                use_time_features=True
-            )
-
             # Load data from CSV
             import pandas as pd
-            self.regressor.data = pd.read_csv(path)
+            data_df = pd.read_csv(path)
 
             # Convert timestamp if present
-            if 'timestamp' in self.regressor.data.columns:
-                self.regressor.data['timestamp'] = pd.to_datetime(self.regressor.data['timestamp'])
+            if 'timestamp' in data_df.columns:
+                data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
 
-            rows = len(self.regressor.data)
+            rows = len(data_df)
+            self.training_data_df = data_df
+            self.update_train_from_data_state()
 
             # Ask if should train immediately
             should_train = messagebox.askyesno(
@@ -636,32 +740,7 @@ class CPUTempMonitorApp:
             )
 
             if should_train:
-                self.progress_label.config(text=f"Training with {rows} rows...")
-                self.progress_var.set(50)
-
-                # Train in thread to avoid blocking UI
-                def train_loaded_data():
-                    try:
-                        self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
-
-                        # Show metrics
-                        metrics = self.regressor.evaluate_metrics()
-                        metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
-                                       f"MAE: {metrics['mae']:.2f}\n"
-                                       f"R2: {metrics['r2']:.3f}\n"
-                                       f"MAPE: {metrics['mape']:.1f}%")
-
-                        self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
-                        self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
-                        self.root.after(0, lambda: self.progress_var.set(100))
-                        self.root.after(0, lambda: self.save_btn.config(state='normal'))
-                        self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
-
-                    except Exception as e:
-                        self.root.after(0, lambda: messagebox.showerror("Error", f"Training failed: {e}"))
-                        self.root.after(0, lambda: self.progress_label.config(text="Training failed"))
-
-                threading.Thread(target=train_loaded_data, daemon=True).start()
+                self.train_from_existing_data()
             else:
                 self.progress_label.config(text=f"Loaded {rows} rows - ready to train")
                 self.save_data_btn.config(state='normal')
@@ -846,6 +925,8 @@ class CPUTempMonitorApp:
                     data['time'] = self.collection_time_counter
                     self.collected_background_data.append(data)
                     self.collection_time_counter += 1
+                    if len(self.collected_background_data) == 1:
+                        self.root.after(0, self.update_train_from_data_state)
 
                     # Update status
                     self.root.after(0, lambda: self.collection_status_label.config(
@@ -916,6 +997,7 @@ class CPUTempMonitorApp:
                 self.collected_background_data = []
                 self.collection_time_counter = 0
                 self.collection_status_label.config(text="Not collecting", foreground='gray')
+                self.update_train_from_data_state()
                 messagebox.showinfo("Cleared", "Collected data has been cleared")
         else:
             messagebox.showinfo("Info", "No collected data to clear")
@@ -1033,6 +1115,68 @@ class CPUTempMonitorApp:
 
         self.simple_tray_thread = threading.Thread(target=run_tray, daemon=True)
         self.simple_tray_thread.start()
+
+    def detect_hardware(self):
+        """Detect and display PC hardware information."""
+        def detect_thread():
+            try:
+                # Show loading message
+                self.root.after(0, lambda: self._update_hw_info_display("Detecting hardware..."))
+
+                # Extract PC info
+                with HardwareMonitor() as monitor:
+                    info = monitor.get_hardware_info()
+
+                    # Build organized dictionary
+                    pc_dict = {}
+
+                    if info['cpu']:
+                        pc_dict['CPU'] = info['cpu']['name']
+
+                    if info['gpu']:
+                        pc_dict['GPU'] = info['gpu']['name']
+
+                    if info['motherboard']:
+                        pc_dict['Motherboard'] = info['motherboard']['name']
+
+                    if info['ram']:
+                        pc_dict['RAM'] = info['ram']['name']
+
+                    if info['storage']:
+                        # Show first storage device
+                        pc_dict['Storage'] = info['storage'][0]['name']
+                        # If multiple storage devices, add count
+                        if len(info['storage']) > 1:
+                            pc_dict['Storage'] += f" (+{len(info['storage'])-1} more)"
+
+                    self.pc_info = pc_dict
+
+                    # Update display
+                    self.root.after(0, lambda: self._update_hw_info_display(self._format_hw_info(pc_dict)))
+
+            except Exception as e:
+                error_msg = f"Failed to detect hardware:\n{str(e)}"
+                self.root.after(0, lambda: self._update_hw_info_display(error_msg))
+
+        threading.Thread(target=detect_thread, daemon=True).start()
+
+    def _format_hw_info(self, pc_dict):
+        """Format PC info dictionary as readable text."""
+        if not pc_dict:
+            return "No hardware information available.\nClick 'Detect Hardware' to scan."
+
+        lines = []
+        for key, value in pc_dict.items():
+            lines.append(f"{key:12}: {value}")
+
+        return "\n".join(lines)
+
+    def _update_hw_info_display(self, text):
+        """Update the hardware info text widget."""
+        self.hw_info_text.config(state='normal')
+        self.hw_info_text.delete(1.0, tk.END)
+        self.hw_info_text.insert(tk.END, text)
+        self.hw_info_text.config(state='disabled')
 
     def quit_application(self):
         """Completely quit the application."""

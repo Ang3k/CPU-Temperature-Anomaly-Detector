@@ -421,7 +421,44 @@ class HardwareMonitor:
                             data[f"gpu_{_SENSOR_TYPE_MAP[stype]}_{name}"] = float(val)
                 break
         return data
-    
+
+    def get_hardware_info(self) -> dict:
+        """
+        Get hardware names and types.
+
+        Returns:
+            dict with hardware information:
+            - cpu: {'name': str, 'type': str}
+            - gpu: {'name': str, 'type': str}
+            - motherboard: {'name': str, 'type': str}
+            - ram: {'name': str, 'type': str}
+            - storage: [{'name': str, 'type': str}, ...]
+        """
+        info = {
+            'cpu': None,
+            'gpu': None,
+            'motherboard': None,
+            'ram': None,
+            'storage': []
+        }
+
+        for hw, prefix in self._hardware_list:
+            hw_name = str(hw.Name)
+            hw_type = str(hw.HardwareType)
+
+            if prefix == "cpu":
+                info['cpu'] = {'name': hw_name, 'type': hw_type}
+            elif prefix == "gpu":
+                info['gpu'] = {'name': hw_name, 'type': hw_type}
+            elif prefix == "mb":
+                info['motherboard'] = {'name': hw_name, 'type': hw_type}
+            elif prefix == "ram":
+                info['ram'] = {'name': hw_name, 'type': hw_type}
+            elif prefix.startswith("disk"):
+                info['storage'].append({'name': hw_name, 'type': hw_type})
+
+        return info
+
     # Ultra-fast single value properties
     @property
     def cpu_temp(self) -> float | None:
