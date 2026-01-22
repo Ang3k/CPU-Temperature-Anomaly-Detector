@@ -41,7 +41,8 @@ class ConfigManager:
         'collect_data_on_monitor': False,
         'collection_interval': 5.0,
         'training_iterations': 1000,
-        'training_interval': 1
+        'training_interval': 1,
+        'mean_time': 0
     }
 
     def __init__(self, config_path='config.yaml'):
@@ -222,6 +223,15 @@ class CPUTempMonitorApp:
         interval_spin = ttk.Spinbox(param_frame, from_=0, to=60, increment=0.5,
                                     textvariable=self.interval_var, width=10)
         interval_spin.grid(row=1, column=1, pady=2, padx=5)
+
+        ttk.Label(param_frame, text="Mean Time (s):").grid(row=2, column=0, sticky='w', pady=2)
+        self.mean_time_var = tk.IntVar(value=self.config.get('mean_time', 0))
+        mean_time_spin = ttk.Spinbox(param_frame, from_=0, to=300, increment=5,
+                                     textvariable=self.mean_time_var, width=10)
+        mean_time_spin.grid(row=2, column=1, pady=2, padx=5)
+
+        ttk.Label(param_frame, text="(0 = no resampling, >0 = average over window)",
+                 font=('TkDefaultFont', 8), foreground='gray').grid(row=3, column=0, columnspan=2, sticky='w', pady=2)
 
         # Training data management
         data_frame = ttk.LabelFrame(frame, text="Training Data Collection", padding=10)
@@ -524,10 +534,15 @@ class CPUTempMonitorApp:
 
         def train_thread():
             try:
+                # Get mean_time parameter
+                mean_time = self.mean_time_var.get()
+                mean_time = mean_time if mean_time > 0 else None
+
                 # Collect data
                 self.regressor.extract_CPU_data(
                     iterations=self.iterations_var.get(),
                     interval=self.interval_var.get(),
+                    mean_time=mean_time,
                     progress_callback=progress_callback,
                     should_stop_callback=lambda: not self.is_training
                 )
@@ -674,6 +689,7 @@ class CPUTempMonitorApp:
             self.config.set('last_model_type', model_type)
             self.config.set('last_scaler', self.scaler_var.get())
             self.config.set('multi_variable', self.multi_variable_var.get())
+            self.config.set('mean_time', self.mean_time_var.get())
             self.config.set('model_path', path)
             self.config.save()
 
@@ -729,14 +745,27 @@ class CPUTempMonitorApp:
             if 'timestamp' in data_df.columns:
                 data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
 
-            rows = len(data_df)
+            # Apply mean_time resampling if specified
+            mean_time = self.mean_time_var.get()
+            if mean_time > 0 and 'timestamp' in data_df.columns:
+                original_rows = len(data_df)
+                data_df = data_df.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
+                # Recreate sequential time column
+                if 'time' in data_df.columns:
+                    data_df['time'] = range(len(data_df))
+                rows = len(data_df)
+                resample_msg = f"\n(Resampled from {original_rows} to {rows} rows using {mean_time}s window)"
+            else:
+                rows = len(data_df)
+                resample_msg = ""
+
             self.training_data_df = data_df
             self.update_train_from_data_state()
 
             # Ask if should train immediately
             should_train = messagebox.askyesno(
                 "Data Loaded",
-                f"Loaded {rows} rows from:\n{path}\n\nTrain model with this data now?"
+                f"Loaded {rows} rows from:\n{path}{resample_msg}\n\nTrain model with this data now?"
             )
 
             if should_train:
@@ -1206,6 +1235,7 @@ class CPUTempMonitorApp:
         self.config.set('collection_interval', self.collection_interval_var.get())
         self.config.set('training_iterations', self.iterations_var.get())
         self.config.set('training_interval', self.interval_var.get())
+        self.config.set('mean_time', self.mean_time_var.get())
         self.config.save()
         messagebox.showinfo("Settings", "Settings saved successfully")
 

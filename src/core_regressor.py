@@ -116,13 +116,14 @@ class CoreTempRegressor:
         self.use_time_features = use_time_features
         self.multi_variable = multi_variable
 
-    def extract_CPU_data(self, iterations=100, interval=5, csv=False, progress_callback=None, should_stop_callback=None):
+    def extract_CPU_data(self, iterations=100, interval=5, mean_time=None, csv=False, progress_callback=None, should_stop_callback=None):
         """
         Extract CPU data for training.
 
         Args:
             iterations: Number of data points to collect
             interval: Time between collections (seconds)
+            mean_time: Optional time window (seconds) for resampling and averaging data. None = no resampling
             csv: If True, load from ../data/data.csv
             progress_callback: Optional callback function(current, total) for progress updates
             should_stop_callback: Optional callback function() that returns True to stop collection
@@ -151,6 +152,14 @@ class CoreTempRegressor:
                         sleep(interval)
 
             self.data = pd.DataFrame(data_list)
+
+        # Apply resampling if mean_time is specified
+        if mean_time is not None and 'timestamp' in self.data.columns:
+            self.data = self.data.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
+            # Recreate sequential time column after resampling
+            if 'time' in self.data.columns:
+                self.data['time'] = range(len(self.data))
+
         return self.data
     
     def plot_CPU_data(self):
