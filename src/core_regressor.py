@@ -1,7 +1,6 @@
 # Standard library imports
 from collections import deque
 from datetime import datetime
-from time import sleep
 
 # Third-party imports
 import numpy as np
@@ -10,20 +9,21 @@ from lightgbm import LGBMRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.decomposition import PCA, KernelPCA
 from xgboost import XGBRegressor
 import plotly.express as px
 import joblib
-
-# Local imports
-from src.cpu_temp_bundled import HardwareMonitor
 
 
 class CoreTempRegressor:
     """
     CPU Temperature anomaly detection using regression models.
+    Receives pre-processed data from ComputerInfoExtractor.
     Can be used for training, saving/loading models, and real-time anomaly detection.
+
+    IMPORTANT: Scaling is performed AFTER train/test split to prevent data leakage.
     """
-    
+
     PLOT_STYLE = {
         'line_width': 3,
         'marker_size': 8,
@@ -35,7 +35,8 @@ class CoreTempRegressor:
         'line_dash': 'dash'
     }
 
-    def __init__(self):
+    def __init__(self, extractor=None):
+        self.extractor = extractor
         self.scaler = None
         self.model = None
         self.data = None
@@ -48,8 +49,6 @@ class CoreTempRegressor:
         self.test_data = None
 
         # Store feature engineering parameters
-        self.lag_steps = None
-        self.rolling_windows = None
         self.use_time_features = None
 
         # Store model name
@@ -68,7 +67,12 @@ class CoreTempRegressor:
         # Feature columns (set after training)
         self.feature_columns = None
 
-    def configure_model(self, model='linear', multi_variable = True, scaler='standard', use_time_features=True, lag_steps=[1, 2, 3], rolling_windows=[3, 5, 7]):
+    def set_data(self, data: pd.DataFrame):
+        """Set pre-processed data from ComputerInfoExtractor."""
+        self.data = data.copy()
+        return self
+
+    def configure_model(self, model='linear', multi_variable=True, scaler='standard', use_time_features=True):
         """Configure the model and scaler to use."""
         scaler_dict = {
             'standard': StandardScaler(),
@@ -105,120 +109,51 @@ class CoreTempRegressor:
                 reg_lambda=1.0,
                 random_state=42,
                 verbose=-1
-            )
+            ),
+            'pca': 'pca',  # Placeholder for backwards compatibility
+            'kernel_pca': 'kernel_pca'  # Placeholder for backwards compatibility
         }
 
         self.model = model_dict.get(model)
         self.scaler = scaler_dict.get(scaler)
         self.model_name = model
-        self.lag_steps = lag_steps
-        self.rolling_windows = rolling_windows
         self.use_time_features = use_time_features
         self.multi_variable = multi_variable
-
-    def extract_CPU_data(self, iterations=100, interval=5, mean_time=None, csv=False, progress_callback=None, should_stop_callback=None):
-        """
-        Extract CPU data for training.
-
-        Args:
-            iterations: Number of data points to collect
-            interval: Time between collections (seconds)
-            mean_time: Optional time window (seconds) for resampling and averaging data. None = no resampling
-            csv: If True, load from ../data/data.csv
-            progress_callback: Optional callback function(current, total) for progress updates
-            should_stop_callback: Optional callback function() that returns True to stop collection
-        """
-        if csv:
-            self.data = pd.read_csv('../data/data.csv')
-            if 'timestamp' in self.data.columns:
-                self.data['timestamp'] = pd.to_datetime(self.data['timestamp'])
-        else:
-            data_list = []
-            with HardwareMonitor() as monitor:
-                for t in range(iterations):
-                    # Check if should stop
-                    if should_stop_callback and should_stop_callback():
-                        break
-
-                    row = monitor.get_essential_fast()
-                    row['timestamp'] = datetime.now()
-                    row['time'] = t
-                    data_list.append(row)
-
-                    if progress_callback:
-                        progress_callback(t + 1, iterations)
-
-                    if interval > 0:
-                        sleep(interval)
-
-            self.data = pd.DataFrame(data_list)
-
-        # Apply resampling if mean_time is specified
-        if mean_time is not None and 'timestamp' in self.data.columns:
-            self.data = self.data.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
-            # Recreate sequential time column after resampling
-            if 'time' in self.data.columns:
-                self.data['time'] = range(len(self.data))
-
-        return self.data
-    
-    def plot_CPU_data(self):
-        px.line(self.data, x='timestamp', y=['cpu_temp','cpu_load','cpu_power','cpu_clock','cpu_volt','gpu_temp','gpu_load','gpu_power','mb_temp','ram_load','fan_rpm'], title='CPU Temperature').show()
-
-    def create_time_features_on_df(self, df, lag_steps, rolling_windows):
-        """Create lag, rolling, and diff features for better predictions."""
-        exclude_cols = ['cpu_temp', 'time', 'fan_rpm', 'timestamp']
-        feature_cols = [col for col in df.columns if col not in exclude_cols and df[col].dtype in ['float64', 'int64', 'float32', 'int32']]
-
-        new_features = {}
-
-        for col in feature_cols:
-            # Lag features
-            for lag in lag_steps:
-                new_features[f'{col}_lag_{lag}'] = df[col].shift(lag)
-
-            # Rolling statistics
-            for window in rolling_windows:
-                new_features[f'{col}_rolling_mean_{window}'] = df[col].rolling(window=window).mean()
-                new_features[f'{col}_rolling_std_{window}'] = df[col].rolling(window=window).std()
-
-            # Rate of change
-            new_features[f'{col}_diff_1'] = df[col].diff(1)
-
-        if new_features:
-            new_cols_df = pd.DataFrame(new_features, index=df.index)
-            df = pd.concat([df, new_cols_df], axis=1)
-
-        return df
 
     def fit_predict(self, train_size=0.8, threshold_std=1.5):
         """
         Train the model and make predictions on test set.
-        Also calculates anomaly thresholds.
+        Data should already be pre-processed by ComputerInfoExtractor.
+
+        CRITICAL: Scaling is done HERE after train/test split to prevent data leakage.
+        The scaler is fit ONLY on training data, then applied to test data.
         """
+        if self.data is None:
+            raise ValueError("No data set. Use set_data() with pre-processed data from ComputerInfoExtractor.")
+
         self.threshold_std = threshold_std
 
-        # Split the raw data FIRST (before feature engineering)
-        split_idx = int(len(self.data) * train_size)
-        train_data = self.data[:split_idx].copy()
-        test_data = self.data[split_idx:].copy()
+        # Data is already processed (features created, missing values filled)
+        df = self.data.copy()
 
-        # Apply time features SEPARATELY to train and test
-        if self.use_time_features == True and self.multi_variable == True:
-            train_data = self.create_time_features_on_df(train_data, self.lag_steps, self.rolling_windows)
-            test_data = self.create_time_features_on_df(test_data, self.lag_steps, self.rolling_windows)
+        # Split the data BEFORE scaling
+        split_idx = int(len(df) * train_size)
+        train_data = df[:split_idx].copy()
+        test_data = df[split_idx:].copy()
 
-            train_data = train_data.dropna()
-            test_data = test_data.dropna()
+        # Drop NaN rows (from lag/rolling features)
+        train_data = train_data.dropna()
+        test_data = test_data.dropna()
 
         # Prepare X and y
-        if self.multi_variable == True:
-            x_train = train_data.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1)
+        exclude_cols = ['cpu_temp', 'time', 'fan_rpm', 'timestamp']
+        if self.multi_variable:
+            feature_cols = [col for col in train_data.columns if col not in exclude_cols]
+            x_train = train_data[feature_cols]
             y_train = train_data['cpu_temp']
 
-            self.x_test = test_data.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1)
+            self.x_test = test_data[feature_cols]
             self.y_test = test_data['cpu_temp']
-        
         else:
             x_train = train_data[['time']]
             y_train = train_data['cpu_temp']
@@ -229,7 +164,7 @@ class CoreTempRegressor:
         # Store feature columns for later use
         self.feature_columns = list(x_train.columns)
 
-        # Fit scaler ONLY on training data
+        # Fit scaler ONLY on training data (prevents data leakage)
         x_train_scaled = self.scaler.fit_transform(x_train)
         x_test_scaled = self.scaler.transform(self.x_test)
 
@@ -277,15 +212,18 @@ class CoreTempRegressor:
 
     def init_realtime_buffer(self):
         """Initialize the buffer for real-time anomaly detection."""
-        max_window = max(self.rolling_windows) if self.rolling_windows else 7
-        max_lag = max(self.lag_steps) if self.lag_steps else 3
-        buffer_size = max(max_window, max_lag) + 5  # Extra buffer
+        if self.extractor is None:
+            raise ValueError("Extractor required for real-time detection. Pass ComputerInfoExtractor to constructor.")
+        max_window = max(self.extractor.rolling_windows) if self.extractor.rolling_windows else 7
+        max_lag = max(self.extractor.lag_steps) if self.extractor.lag_steps else 3
+        buffer_size = max(max_window, max_lag) + 5
         self.data_buffer = deque(maxlen=buffer_size)
         self.time_counter = 0
 
     def detect_anomaly(self, current_data: dict) -> tuple:
         """
         Detect if current data point is an anomaly.
+        Uses extractor to create time features from buffer.
 
         Args:
             current_data: Dict with sensor readings from HardwareMonitor.get_essential_fast()
@@ -293,6 +231,9 @@ class CoreTempRegressor:
         Returns:
             tuple: (is_anomaly: bool, diff: float, predicted: float, actual: float)
         """
+        if self.extractor is None:
+            raise ValueError("Extractor required for real-time detection. Pass ComputerInfoExtractor to constructor.")
+
         if self.data_buffer is None:
             self.init_realtime_buffer()
 
@@ -306,17 +247,18 @@ class CoreTempRegressor:
         self.data_buffer.append(current_data)
 
         # Need enough history for features
-        min_required = max(max(self.rolling_windows), max(self.lag_steps)) + 1
+        min_required = max(max(self.extractor.rolling_windows), max(self.extractor.lag_steps)) + 1
         if len(self.data_buffer) < min_required:
             return False, 0.0, 0.0, current_data.get('cpu_temp', 0.0)
 
-        # Create DataFrame from buffer
-        df = pd.DataFrame(list(self.data_buffer))
+        # Create DataFrame from buffer and use extractor for feature engineering
+        self.extractor.data = pd.DataFrame(list(self.data_buffer))
 
-        # Apply time features
-        if self.use_time_features == True and self.multi_variable == True:
-            df = self.create_time_features_on_df(df, self.lag_steps, self.rolling_windows)
+        if self.use_time_features and self.multi_variable:
+            df = self.extractor.create_time_features_on_df()
             df = df.dropna()
+        else:
+            df = self.extractor.data.copy()
 
         if len(df) == 0:
             return False, 0.0, 0.0, current_data.get('cpu_temp', 0.0)
@@ -325,12 +267,11 @@ class CoreTempRegressor:
         last_row = df.iloc[[-1]]
 
         # Prepare features
-        if self.multi_variable == True:
+        if self.multi_variable:
             X = last_row.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1, errors='ignore')
-
         else:
             X = last_row[['time']]
-            
+
         # Ensure columns match training
         if self.feature_columns:
             missing_cols = set(self.feature_columns) - set(X.columns)
@@ -347,8 +288,9 @@ class CoreTempRegressor:
         is_anomaly = diff < self.low_threshold or diff > self.high_threshold
 
         return is_anomaly, diff, predicted, actual
-    
-    def plot_predictions(self, threshold_std=1.5):
+
+    def plot_predictions(self):
+        """Plot predictions and anomaly detection results."""
         # Use stored test_data time values
         time_test = self.test_data['time'].values
         timestamp_test = self.test_data['timestamp'].values
@@ -367,8 +309,8 @@ class CoreTempRegressor:
         df_test["diff"] = df_test["Actual"] - df_test["Predicted"]
         mean_diff = df_test["diff"].mean()
         stardard_dev = df_test["diff"].std()
-        low_lim = mean_diff - threshold_std * stardard_dev
-        high_lim = mean_diff + threshold_std * stardard_dev
+        low_lim = mean_diff - self.threshold_std * stardard_dev
+        high_lim = mean_diff + self.threshold_std * stardard_dev
 
         # Transform to long format (better for px.line)
         df_plot = df_test.melt(id_vars="timestamp", value_vars=["diff"], var_name="Type", value_name="Temperature Diff")
@@ -376,30 +318,30 @@ class CoreTempRegressor:
         # Predictions plot
         fig_pred = px.line(df_test, x="timestamp", y=["Actual", "Predicted"], title=f"{model_display_name} Regression: CPU Temp: Predicted vs Actual")
         fig_pred.update_traces(
-            line_width=self.PLOT_STYLE['line_width'], 
-            marker=dict(size=self.PLOT_STYLE['marker_size'])
+            line_width=self.PLOT_STYLE['line_width'],
+            marker={'size': self.PLOT_STYLE['marker_size']}
         )
         fig_pred.show()
 
         # Error plot
         fig = px.line(df_plot, x="timestamp", y="Temperature Diff", color="Type", title=f"{model_display_name} Regression: CPU Temp Difference: Predicted vs Actual")
         fig.update_traces(
-            line_color=self.PLOT_STYLE['error_color'], 
-            line_width=self.PLOT_STYLE['line_width'], 
-            marker=dict(size=self.PLOT_STYLE['marker_size'])
+            line_color=self.PLOT_STYLE['error_color'],
+            line_width=self.PLOT_STYLE['line_width'],
+            marker={'size': self.PLOT_STYLE['marker_size']}
         )
         fig.add_hline(
-            y=low_lim, 
-            line_width=self.PLOT_STYLE['threshold_line_width'], 
-            line_color=self.PLOT_STYLE['lower_threshold_color'], 
-            line_dash=self.PLOT_STYLE['line_dash'], 
+            y=low_lim,
+            line_width=self.PLOT_STYLE['threshold_line_width'],
+            line_color=self.PLOT_STYLE['lower_threshold_color'],
+            line_dash=self.PLOT_STYLE['line_dash'],
             opacity=self.PLOT_STYLE['threshold_opacity']
         )
         fig.add_hline(
-            y=high_lim, 
-            line_width=self.PLOT_STYLE['threshold_line_width'], 
-            line_color=self.PLOT_STYLE['upper_threshold_color'], 
-            line_dash=self.PLOT_STYLE['line_dash'], 
+            y=high_lim,
+            line_width=self.PLOT_STYLE['threshold_line_width'],
+            line_color=self.PLOT_STYLE['upper_threshold_color'],
+            line_dash=self.PLOT_STYLE['line_dash'],
             opacity=self.PLOT_STYLE['threshold_opacity']
         )
         fig.show()
@@ -430,7 +372,409 @@ class CoreTempRegressor:
     @staticmethod
     def load_model(path: str) -> 'CoreTempRegressor':
         """Load a trained model from file."""
+        from src.data_extractor import ComputerInfoExtractor
+
         model = joblib.load(path)
-        # Initialize buffer for real-time detection
-        model.init_realtime_buffer()
+
+        # Backward compatibility: Add extractor if not present (for old models)
+        if not hasattr(model, 'extractor') or model.extractor is None:
+            # Create extractor with default parameters
+            extractor = ComputerInfoExtractor(
+                scaler_type='standard',
+                use_time_features=getattr(model, 'use_time_features', True),
+                lag_steps=getattr(model, 'lag_steps', [1, 2, 3]),
+                rolling_windows=getattr(model, 'rolling_windows', [3, 5, 7])
+            )
+            model.extractor = extractor
+
+        # Initialize buffer for real-time detection if extractor exists
+        if model.extractor and hasattr(model, 'init_realtime_buffer'):
+            try:
+                model.init_realtime_buffer()
+            except:
+                pass  # Buffer initialization might fail if extractor params are missing
+
+        return model
+
+
+class CoreTempPCA:
+    """
+    CPU Temperature anomaly detection using PCA reconstruction error.
+    Trains PCA on healthy data, then detects anomalies based on reconstruction error.
+    """
+
+    PLOT_STYLE = {
+        'line_width': 3,
+        'marker_size': 8,
+        'threshold_line_width': 5,
+        'threshold_opacity': 0.5,
+        'error_color': 'orange',
+        'lower_threshold_color': 'green',
+        'upper_threshold_color': 'red',
+        'line_dash': 'dash'
+    }
+
+    def __init__(self, extractor=None):
+        self.extractor = extractor
+        self.scaler = None
+        self.pca = None
+        self.data = None
+
+        # Store for predictions/reconstruction
+        self.x_test = None
+        self.y_test = None
+        self.reconstruction_error = None
+        self.test_data = None
+
+        # Store feature engineering parameters
+        self.use_time_features = None
+
+        # Store model name
+        self.model_name = None
+        self.multi_variable = True
+
+        # Anomaly detection thresholds
+        self.low_threshold = None
+        self.high_threshold = None
+        self.threshold_std = 1.5
+
+        # Real-time monitoring buffer
+        self.data_buffer = None
+        self.time_counter = 0
+
+        # Feature columns (set after training)
+        self.feature_columns = None
+
+    def set_data(self, data: pd.DataFrame):
+        """Set pre-processed data from ComputerInfoExtractor."""
+        self.data = data.copy()
+        return self
+
+    def configure_model(self, model='pca', multi_variable=True, scaler='standard', use_time_features=True, n_components=0.95):
+        """Configure the PCA model and scaler to use."""
+        scaler_dict = {
+            'standard': StandardScaler(),
+            'minmax': MinMaxScaler(),
+            'robust': RobustScaler()
+        }
+
+        model_dict = {
+            'pca': PCA(
+                n_components=n_components,
+                random_state=42
+            ),
+            'kernel_pca': KernelPCA(
+                n_components=n_components if isinstance(n_components, int) else 10,
+                kernel='rbf',
+                random_state=42,
+                fit_inverse_transform=True
+            )
+        }
+
+        self.pca = model_dict.get(model)
+        self.scaler = scaler_dict.get(scaler)
+        self.model_name = model
+        self.use_time_features = use_time_features
+        self.multi_variable = multi_variable
+
+    def fit_predict(self, train_size=0.8, threshold_std=1.5):
+        """
+        Train PCA on healthy data and detect anomalies based on reconstruction error.
+
+        Workflow:
+        1. Split data into train (healthy) and test
+        2. Scale features (fit on train only)
+        3. Fit PCA on scaled training data
+        4. Transform test data through PCA
+        5. Inverse transform to reconstruct original features
+        6. Calculate reconstruction error
+        7. Anomalies have high reconstruction error
+
+        CRITICAL: Scaling and PCA are fit ONLY on training data to prevent data leakage.
+        """
+        if self.data is None:
+            raise ValueError("No data set. Use set_data() with pre-processed data from ComputerInfoExtractor.")
+
+        self.threshold_std = threshold_std
+
+        # Data is already processed (features created, missing values filled)
+        df = self.data.copy()
+
+        # Split the data BEFORE scaling
+        split_idx = int(len(df) * train_size)
+        train_data = df[:split_idx].copy()
+        test_data = df[split_idx:].copy()
+
+        # Drop NaN rows (from lag/rolling features)
+        train_data = train_data.dropna()
+        test_data = test_data.dropna()
+
+        # Prepare X and y
+        exclude_cols = ['cpu_temp', 'time', 'fan_rpm', 'timestamp']
+        if self.multi_variable:
+            feature_cols = [col for col in train_data.columns if col not in exclude_cols]
+            x_train = train_data[feature_cols]
+            y_train = train_data['cpu_temp']
+
+            self.x_test = test_data[feature_cols]
+            self.y_test = test_data['cpu_temp']
+        else:
+            x_train = train_data[['time']]
+            y_train = train_data['cpu_temp']
+
+            self.x_test = test_data[['time']]
+            self.y_test = test_data['cpu_temp']
+
+        # Store feature columns for later use
+        self.feature_columns = list(x_train.columns)
+
+        # Step 1: Fit scaler ONLY on training data (prevents data leakage)
+        x_train_scaled = self.scaler.fit_transform(x_train)
+        x_test_scaled = self.scaler.transform(self.x_test)
+
+        # Step 2: Fit PCA ONLY on scaled training data (healthy data)
+        self.pca.fit(x_train_scaled)
+
+        # Step 3: Transform test data through PCA (reduce dimensions)
+        x_test_pca = self.pca.transform(x_test_scaled)
+
+        # Step 4: Inverse transform to reconstruct original features
+        x_test_reconstructed = self.pca.inverse_transform(x_test_pca)
+
+        # Step 5: Calculate reconstruction error (MSE per sample)
+        self.reconstruction_error = np.mean((x_test_scaled - x_test_reconstructed) ** 2, axis=1)
+
+        if hasattr(self.pca, 'n_components_'):
+            print(f"PCA reduced dimensions from {x_train_scaled.shape[1]} to {self.pca.n_components_}")
+            print(f"Explained variance ratio: {self.pca.explained_variance_ratio_.sum():.4f}")
+        else:
+            print(f"Using {self.model_name} with configured components")
+
+        # Store test_data for plotting
+        self.test_data = test_data
+
+        # Calculate anomaly thresholds based on reconstruction error
+        mean_error = np.mean(self.reconstruction_error)
+        std_error = np.std(self.reconstruction_error)
+        self.low_threshold = mean_error - threshold_std * std_error
+        self.high_threshold = mean_error + threshold_std * std_error
+
+    def predict(self, X):
+        """Calculate reconstruction error for new data."""
+        X_scaled = self.scaler.transform(X)
+        X_pca = self.pca.transform(X_scaled)
+        X_reconstructed = self.pca.inverse_transform(X_pca)
+        reconstruction_error = np.mean((X_scaled - X_reconstructed) ** 2, axis=1)
+        return reconstruction_error
+
+    def detect_anomaly(self, current_data: dict) -> tuple:
+        """
+        Detect if current data point is an anomaly using PCA reconstruction error.
+        Uses extractor to create time features from buffer.
+
+        Args:
+            current_data: Dict with sensor readings from HardwareMonitor.get_essential_fast()
+
+        Returns:
+            tuple: (is_anomaly: bool, reconstruction_error: float, threshold: float, actual: float)
+        """
+        if self.extractor is None:
+            raise ValueError("Extractor required for real-time detection. Pass ComputerInfoExtractor to constructor.")
+
+        if self.data_buffer is None:
+            self.init_realtime_buffer()
+
+        # Add timestamp and time
+        current_data = current_data.copy()
+        current_data['timestamp'] = datetime.now()
+        current_data['time'] = self.time_counter
+        self.time_counter += 1
+
+        # Add to buffer
+        self.data_buffer.append(current_data)
+
+        # Need enough history for features
+        min_required = max(max(self.extractor.rolling_windows), max(self.extractor.lag_steps)) + 1
+        if len(self.data_buffer) < min_required:
+            return False, 0.0, self.high_threshold or 0.0, current_data.get('cpu_temp', 0.0)
+
+        # Create DataFrame from buffer and use extractor for feature engineering
+        self.extractor.data = pd.DataFrame(list(self.data_buffer))
+
+        if self.use_time_features and self.multi_variable:
+            df = self.extractor.create_time_features_on_df()
+            df = df.dropna()
+        else:
+            df = self.extractor.data.copy()
+
+        if len(df) == 0:
+            return False, 0.0, self.high_threshold or 0.0, current_data.get('cpu_temp', 0.0)
+
+        # Get last row for prediction
+        last_row = df.iloc[[-1]]
+
+        # Prepare features
+        if self.multi_variable:
+            X = last_row.drop(['cpu_temp', 'time', 'fan_rpm', 'timestamp'], axis=1, errors='ignore')
+        else:
+            X = last_row[['time']]
+
+        # Ensure columns match training
+        if self.feature_columns:
+            missing_cols = set(self.feature_columns) - set(X.columns)
+            for col in missing_cols:
+                X[col] = 0
+            X = X[self.feature_columns]
+
+        # Calculate reconstruction error
+        error = self.predict(X)[0]
+        actual = current_data.get('cpu_temp', 0.0)
+
+        # Check anomaly
+        is_anomaly = error < self.low_threshold or error > self.high_threshold
+
+        return is_anomaly, error, self.high_threshold, actual
+
+    def init_realtime_buffer(self):
+        """Initialize the buffer for real-time anomaly detection."""
+        if self.extractor is None:
+            raise ValueError("Extractor required for real-time detection. Pass ComputerInfoExtractor to constructor.")
+        max_window = max(self.extractor.rolling_windows) if self.extractor.rolling_windows else 7
+        max_lag = max(self.extractor.lag_steps) if self.extractor.lag_steps else 3
+        buffer_size = max(max_window, max_lag) + 5
+        self.data_buffer = deque(maxlen=buffer_size)
+        self.time_counter = 0
+
+    def recalculate_thresholds(self, threshold_std: float):
+        """Recalculate thresholds with new std multiplier without retraining."""
+        if self.reconstruction_error is None:
+            raise ValueError("Model must be trained before recalculating thresholds")
+
+        self.threshold_std = threshold_std
+        mean_error = np.mean(self.reconstruction_error)
+        std_error = np.std(self.reconstruction_error)
+        self.low_threshold = mean_error - threshold_std * std_error
+        self.high_threshold = mean_error + threshold_std * std_error
+
+    def plot_predictions(self):
+        """Plot reconstruction error and anomaly detection results."""
+        # Use stored test_data time values
+        time_test = self.test_data['time'].values
+        timestamp_test = self.test_data['timestamp'].values
+
+        # Get model name for titles
+        model_display_name = self.model_name.upper() if self.model_name else "PCA"
+
+        # Prepare data
+        df_test = pd.DataFrame()
+        df_test['time'] = time_test
+        df_test['timestamp'] = timestamp_test
+        df_test["Actual Temperature"] = self.y_test.values
+        df_test["Reconstruction Error"] = self.reconstruction_error
+        df_test = df_test.sort_values("time")
+
+        # Calculate thresholds
+        mean_error = np.mean(self.reconstruction_error)
+        std_error = np.std(self.reconstruction_error)
+        low_lim = mean_error - self.threshold_std * std_error
+        high_lim = mean_error + self.threshold_std * std_error
+
+        # Reconstruction error plot
+        fig = px.line(df_test, x="timestamp", y="Reconstruction Error",
+                      title=f"{model_display_name}: Reconstruction Error Over Time")
+        fig.update_traces(
+            line_color=self.PLOT_STYLE['error_color'],
+            line_width=self.PLOT_STYLE['line_width'],
+            marker={'size': self.PLOT_STYLE['marker_size']}
+        )
+        fig.add_hline(
+            y=low_lim,
+            line_width=self.PLOT_STYLE['threshold_line_width'],
+            line_color=self.PLOT_STYLE['lower_threshold_color'],
+            line_dash=self.PLOT_STYLE['line_dash'],
+            opacity=self.PLOT_STYLE['threshold_opacity']
+        )
+        fig.add_hline(
+            y=high_lim,
+            line_width=self.PLOT_STYLE['threshold_line_width'],
+            line_color=self.PLOT_STYLE['upper_threshold_color'],
+            line_dash=self.PLOT_STYLE['line_dash'],
+            opacity=self.PLOT_STYLE['threshold_opacity']
+        )
+        fig.show()
+
+        # Temperature with anomaly overlay
+        df_test["is_anomaly"] = (df_test["Reconstruction Error"] > high_lim) | (df_test["Reconstruction Error"] < low_lim)
+        fig_temp = px.line(df_test, x="timestamp", y="Actual Temperature",
+                           title=f"{model_display_name}: CPU Temperature with Anomalies Highlighted")
+
+        # Highlight anomalies
+        anomaly_points = df_test[df_test["is_anomaly"]]
+        if len(anomaly_points) > 0:
+            fig_temp.add_scatter(
+                x=anomaly_points["timestamp"],
+                y=anomaly_points["Actual Temperature"],
+                mode='markers',
+                marker=dict(color='red', size=12, symbol='x'),
+                name='Anomaly'
+            )
+        fig_temp.show()
+
+        # Anomaly detection plot
+        fig_anom = px.line(df_test, x="timestamp", y="is_anomaly",
+                          title=f"{model_display_name}: Anomaly Detection", markers=True)
+        fig_anom.show()
+
+    def evaluate_metrics(self):
+        """Calculate and return evaluation metrics for reconstruction."""
+        mean_error = np.mean(self.reconstruction_error)
+        std_error = np.std(self.reconstruction_error)
+        max_error = np.max(self.reconstruction_error)
+        min_error = np.min(self.reconstruction_error)
+
+        # Count anomalies
+        anomalies = (self.reconstruction_error > self.high_threshold) | (self.reconstruction_error < self.low_threshold)
+        n_anomalies = np.sum(anomalies)
+        anomaly_rate = n_anomalies / len(self.reconstruction_error) * 100
+
+        return {
+            'mean_reconstruction_error': mean_error,
+            'std_reconstruction_error': std_error,
+            'max_reconstruction_error': max_error,
+            'min_reconstruction_error': min_error,
+            'n_anomalies': n_anomalies,
+            'anomaly_rate_percent': anomaly_rate,
+            'low_threshold': self.low_threshold,
+            'high_threshold': self.high_threshold
+        }
+
+    def save_model(self, path: str):
+        """Save the trained model to file."""
+        joblib.dump(self, path)
+
+    @staticmethod
+    def load_model(path: str) -> 'CoreTempPCA':
+        """Load a trained model from file."""
+        from src.data_extractor import ComputerInfoExtractor
+
+        model = joblib.load(path)
+
+        # Backward compatibility: Add extractor if not present
+        if not hasattr(model, 'extractor') or model.extractor is None:
+            # Create extractor with default parameters
+            extractor = ComputerInfoExtractor(
+                scaler_type='standard',
+                use_time_features=getattr(model, 'use_time_features', True),
+                lag_steps=[1, 2, 3],
+                rolling_windows=[3, 5, 7]
+            )
+            model.extractor = extractor
+
+        # Initialize buffer for real-time detection if extractor exists
+        if model.extractor and hasattr(model, 'init_realtime_buffer'):
+            try:
+                model.init_realtime_buffer()
+            except:
+                pass  # Buffer initialization might fail if extractor params are missing
+
         return model

@@ -13,7 +13,8 @@ from pathlib import Path
 
 import yaml
 
-from src.core_regressor import CoreTempRegressor
+from src.core_regressor import CoreTempRegressor, CoreTempPCA
+from src.data_extractor import ComputerInfoExtractor
 from src.tray_monitor import TrayMonitor
 from src.cpu_temp_bundled import HardwareMonitor
 
@@ -35,7 +36,10 @@ class ConfigManager:
         'threshold_std': 1.5,
         'check_interval': 5,
         'notifications_enabled': True,
+        'model_approach': 'regressor',
         'last_model_type': 'lightgbm',
+        'pca_type': 'pca',
+        'pca_components': 5,
         'last_scaler': 'standard',
         'multi_variable': True,
         'collect_data_on_monitor': False,
@@ -190,23 +194,55 @@ class CPUTempMonitorApp:
         model_frame = ttk.LabelFrame(frame, text="Model Configuration", padding=10)
         model_frame.pack(fill='x', padx=10, pady=5)
 
-        ttk.Label(model_frame, text="Model Type:").grid(row=0, column=0, sticky='w', pady=2)
-        self.model_type_var = tk.StringVar(value=self.config.get('last_model_type', 'lightgbm'))
-        model_combo = ttk.Combobox(model_frame, textvariable=self.model_type_var,
-                                   values=['linear', 'xgb', 'lightgbm'], state='readonly', width=15)
-        model_combo.grid(row=0, column=1, pady=2, padx=5)
+        # Model Approach Selection (Regressor vs PCA)
+        ttk.Label(model_frame, text="Approach:").grid(row=0, column=0, sticky='w', pady=2)
+        self.model_approach_var = tk.StringVar(value=self.config.get('model_approach', 'regressor'))
+        approach_frame = ttk.Frame(model_frame)
+        approach_frame.grid(row=0, column=1, columnspan=3, sticky='w', pady=2)
 
-        ttk.Label(model_frame, text="Scaler:").grid(row=1, column=0, sticky='w', pady=2)
+        regressor_radio = ttk.Radiobutton(approach_frame, text="Regressor", variable=self.model_approach_var,
+                                          value='regressor', command=self.on_approach_change)
+        regressor_radio.pack(side='left', padx=(0, 15))
+        pca_radio = ttk.Radiobutton(approach_frame, text="PCA", variable=self.model_approach_var,
+                                    value='pca', command=self.on_approach_change)
+        pca_radio.pack(side='left')
+
+        # Regressor model type
+        ttk.Label(model_frame, text="Regressor:").grid(row=1, column=0, sticky='w', pady=2)
+        self.model_type_var = tk.StringVar(value=self.config.get('last_model_type', 'lightgbm'))
+        self.regressor_combo = ttk.Combobox(model_frame, textvariable=self.model_type_var,
+                                            values=['linear', 'xgb', 'lightgbm'], state='readonly', width=12)
+        self.regressor_combo.grid(row=1, column=1, pady=2, padx=5, sticky='w')
+
+        # PCA model type
+        ttk.Label(model_frame, text="PCA Type:").grid(row=1, column=2, sticky='w', pady=2, padx=(10, 0))
+        self.pca_type_var = tk.StringVar(value=self.config.get('pca_type', 'pca'))
+        self.pca_combo = ttk.Combobox(model_frame, textvariable=self.pca_type_var,
+                                      values=['pca', 'kernel_pca'], state='readonly', width=12)
+        self.pca_combo.grid(row=1, column=3, pady=2, padx=5, sticky='w')
+
+        # PCA components
+        ttk.Label(model_frame, text="PCA Components:").grid(row=2, column=2, sticky='w', pady=2, padx=(10, 0))
+        self.pca_components_var = tk.IntVar(value=self.config.get('pca_components', 5))
+        self.pca_components_spin = ttk.Spinbox(model_frame, from_=2, to=50, increment=1,
+                                               textvariable=self.pca_components_var, width=10)
+        self.pca_components_spin.grid(row=2, column=3, pady=2, padx=5, sticky='w')
+
+        # Scaler
+        ttk.Label(model_frame, text="Scaler:").grid(row=2, column=0, sticky='w', pady=2)
         self.scaler_var = tk.StringVar(value=self.config.get('last_scaler', 'standard'))
         scaler_combo = ttk.Combobox(model_frame, textvariable=self.scaler_var,
-                                    values=['standard', 'minmax', 'robust'], state='readonly', width=15)
-        scaler_combo.grid(row=1, column=1, pady=2, padx=5)
+                                    values=['standard', 'minmax', 'robust'], state='readonly', width=12)
+        scaler_combo.grid(row=2, column=1, pady=2, padx=5, sticky='w')
 
         # Multi-variable checkbox
         self.multi_variable_var = tk.BooleanVar(value=self.config.get('multi_variable', True))
         multi_var_check = ttk.Checkbutton(model_frame, text="Use all sensors (multi-variable mode)",
                                           variable=self.multi_variable_var)
-        multi_var_check.grid(row=2, column=0, columnspan=2, sticky='w', pady=5)
+        multi_var_check.grid(row=3, column=0, columnspan=4, sticky='w', pady=5)
+
+        # Initialize UI state based on current approach
+        self.on_approach_change()
 
         # Training parameters
         param_frame = ttk.LabelFrame(frame, text="Training Parameters", padding=10)
@@ -485,6 +521,20 @@ class CPUTempMonitorApp:
                      "5. To quit: use tray menu 'Quit'")
         ttk.Label(info_frame, text=info_text, justify='left').pack()
 
+    def on_approach_change(self):
+        """Handle approach change between Regressor and PCA."""
+        approach = self.model_approach_var.get()
+        if approach == 'regressor':
+            # Enable regressor combo, disable PCA options
+            self.regressor_combo.config(state='readonly')
+            self.pca_combo.config(state='disabled')
+            self.pca_components_spin.config(state='disabled')
+        else:
+            # Disable regressor combo, enable PCA options
+            self.regressor_combo.config(state='disabled')
+            self.pca_combo.config(state='readonly')
+            self.pca_components_spin.config(state='normal')
+
     def browse_model(self):
         """Open file dialog to select a model."""
         initial_dir = 'models' if os.path.exists('models') else '.'
@@ -516,15 +566,6 @@ class CPUTempMonitorApp:
         self.save_btn.config(state='disabled')
         self.progress_var.set(0)
 
-        # Create regressor
-        self.regressor = CoreTempRegressor()
-        self.regressor.configure_model(
-            model=self.model_type_var.get(),
-            multi_variable=self.multi_variable_var.get(),
-            scaler=self.scaler_var.get(),
-            use_time_features=True
-        )
-
         def progress_callback(current, total):
             progress = (current / total) * 100
             self.root.after(0, lambda: self.progress_var.set(progress))
@@ -538,8 +579,17 @@ class CPUTempMonitorApp:
                 mean_time = self.mean_time_var.get()
                 mean_time = mean_time if mean_time > 0 else None
 
-                # Collect data
-                self.regressor.extract_CPU_data(
+                # Create extractor and collect data
+                extractor = ComputerInfoExtractor(
+                    scaler_type=self.scaler_var.get(),
+                    use_time_features=True,
+                    lag_steps=[1, 2, 3],
+                    rolling_windows=[3, 5, 7]
+                )
+
+                # Extract and preprocess data
+                processed_data = extractor.extract_data_pipeline(
+                    csv=False,
                     iterations=self.iterations_var.get(),
                     interval=self.interval_var.get(),
                     mean_time=mean_time,
@@ -547,24 +597,60 @@ class CPUTempMonitorApp:
                     should_stop_callback=lambda: not self.is_training
                 )
 
-                if self.regressor.data is not None and len(self.regressor.data) > 0:
-                    self.training_data_df = self.regressor.data.copy()
+                if processed_data is not None and len(processed_data) > 0:
+                    self.training_data_df = extractor.data.copy()
                     self.root.after(0, self.update_train_from_data_state)
                     self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
 
                 if not self.is_training:  # Stopped
                     return
 
-                # Train
-                self.root.after(0, lambda: self.progress_label.config(text="Training model..."))
-                self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+                # Get selected approach
+                approach = self.model_approach_var.get()
 
-                # Show metrics
-                metrics = self.regressor.evaluate_metrics()
-                metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
-                               f"MAE: {metrics['mae']:.2f}\n"
-                               f"R2: {metrics['r2']:.3f}\n"
-                               f"MAPE: {metrics['mape']:.1f}%")
+                if approach == 'regressor':
+                    # Create regressor with extractor
+                    self.regressor = CoreTempRegressor(extractor=extractor)
+                    self.regressor.set_data(processed_data)
+                    self.regressor.configure_model(
+                        model=self.model_type_var.get(),
+                        multi_variable=self.multi_variable_var.get(),
+                        scaler=self.scaler_var.get(),
+                        use_time_features=True
+                    )
+
+                    # Train
+                    self.root.after(0, lambda: self.progress_label.config(text="Training regressor model..."))
+                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                    # Show metrics
+                    metrics = self.regressor.evaluate_metrics()
+                    metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
+                                   f"MAE: {metrics['mae']:.2f}\n"
+                                   f"R2: {metrics['r2']:.3f}\n"
+                                   f"MAPE: {metrics['mape']:.1f}%")
+                else:
+                    # Create PCA model with extractor
+                    self.regressor = CoreTempPCA(extractor=extractor)
+                    self.regressor.set_data(processed_data)
+                    self.regressor.configure_model(
+                        model=self.pca_type_var.get(),
+                        multi_variable=self.multi_variable_var.get(),
+                        scaler=self.scaler_var.get(),
+                        use_time_features=True,
+                        n_components=self.pca_components_var.get()
+                    )
+
+                    # Train
+                    self.root.after(0, lambda: self.progress_label.config(text="Training PCA model..."))
+                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                    # Show metrics
+                    metrics = self.regressor.evaluate_metrics()
+                    metrics_text = (f"Mean Recon Error: {metrics['mean_reconstruction_error']:.4f}\n"
+                                   f"Std Recon Error: {metrics['std_reconstruction_error']:.4f}\n"
+                                   f"Anomalies: {metrics['n_anomalies']}\n"
+                                   f"Anomaly Rate: {metrics['anomaly_rate_percent']:.1f}%")
 
                 self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
                 self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
@@ -614,26 +700,67 @@ class CPUTempMonitorApp:
 
         def train_thread():
             try:
-                self.regressor = CoreTempRegressor()
-                self.regressor.configure_model(
-                    model=self.model_type_var.get(),
-                    multi_variable=self.multi_variable_var.get(),
-                    scaler=self.scaler_var.get(),
-                    use_time_features=True
+                # Create extractor and set existing data
+                extractor = ComputerInfoExtractor(
+                    scaler_type=self.scaler_var.get(),
+                    use_time_features=True,
+                    lag_steps=[1, 2, 3],
+                    rolling_windows=[3, 5, 7]
                 )
 
-                self.regressor.data = data_df.copy()
-                if 'timestamp' in self.regressor.data.columns:
+                # Set raw data and preprocess
+                extractor.data = data_df.copy()
+                if 'timestamp' in extractor.data.columns:
                     import pandas as pd
-                    self.regressor.data['timestamp'] = pd.to_datetime(self.regressor.data['timestamp'])
+                    extractor.data['timestamp'] = pd.to_datetime(extractor.data['timestamp'])
 
-                self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+                # Apply preprocessing pipeline
+                if extractor.use_time_features:
+                    processed_data = extractor.create_time_features_on_df()
+                else:
+                    processed_data = extractor.data.copy()
+                processed_data = processed_data.ffill().bfill().reset_index(drop=True)
 
-                metrics = self.regressor.evaluate_metrics()
-                metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
-                               f"MAE: {metrics['mae']:.2f}\n"
-                               f"R2: {metrics['r2']:.3f}\n"
-                               f"MAPE: {metrics['mape']:.1f}%")
+                # Get selected approach
+                approach = self.model_approach_var.get()
+
+                if approach == 'regressor':
+                    # Create regressor with extractor
+                    self.regressor = CoreTempRegressor(extractor=extractor)
+                    self.regressor.set_data(processed_data)
+                    self.regressor.configure_model(
+                        model=self.model_type_var.get(),
+                        multi_variable=self.multi_variable_var.get(),
+                        scaler=self.scaler_var.get(),
+                        use_time_features=True
+                    )
+
+                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                    metrics = self.regressor.evaluate_metrics()
+                    metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
+                                   f"MAE: {metrics['mae']:.2f}\n"
+                                   f"R2: {metrics['r2']:.3f}\n"
+                                   f"MAPE: {metrics['mape']:.1f}%")
+                else:
+                    # Create PCA model with extractor
+                    self.regressor = CoreTempPCA(extractor=extractor)
+                    self.regressor.set_data(processed_data)
+                    self.regressor.configure_model(
+                        model=self.pca_type_var.get(),
+                        multi_variable=self.multi_variable_var.get(),
+                        scaler=self.scaler_var.get(),
+                        use_time_features=True,
+                        n_components=self.pca_components_var.get()
+                    )
+
+                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                    metrics = self.regressor.evaluate_metrics()
+                    metrics_text = (f"Mean Recon Error: {metrics['mean_reconstruction_error']:.4f}\n"
+                                   f"Std Recon Error: {metrics['std_reconstruction_error']:.4f}\n"
+                                   f"Anomalies: {metrics['n_anomalies']}\n"
+                                   f"Anomaly Rate: {metrics['anomaly_rate_percent']:.1f}%")
 
                 self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
                 self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
@@ -668,8 +795,12 @@ class CPUTempMonitorApp:
         # Ensure directory exists
         os.makedirs('models', exist_ok=True)
 
-        # Generate filename
-        model_type = self.model_type_var.get()
+        # Generate filename based on approach
+        approach = self.model_approach_var.get()
+        if approach == 'regressor':
+            model_type = self.model_type_var.get()
+        else:
+            model_type = self.pca_type_var.get()
         default_name = f"cpu_temp_model_{model_type}.joblib"
 
         path = filedialog.asksaveasfilename(
@@ -686,7 +817,10 @@ class CPUTempMonitorApp:
             self.model_path_var.set(path)
 
             # Update config
-            self.config.set('last_model_type', model_type)
+            self.config.set('model_approach', approach)
+            self.config.set('last_model_type', self.model_type_var.get())
+            self.config.set('pca_type', self.pca_type_var.get())
+            self.config.set('pca_components', self.pca_components_var.get())
             self.config.set('last_scaler', self.scaler_var.get())
             self.config.set('multi_variable', self.multi_variable_var.get())
             self.config.set('mean_time', self.mean_time_var.get())
@@ -1152,36 +1286,14 @@ class CPUTempMonitorApp:
                 # Show loading message
                 self.root.after(0, lambda: self._update_hw_info_display("Detecting hardware..."))
 
-                # Extract PC info
-                with HardwareMonitor() as monitor:
-                    info = monitor.get_hardware_info()
+                # Extract PC info using ComputerInfoExtractor
+                extractor = ComputerInfoExtractor()
+                pc_dict = extractor.extract_PC_info()
 
-                    # Build organized dictionary
-                    pc_dict = {}
+                self.pc_info = pc_dict
 
-                    if info['cpu']:
-                        pc_dict['CPU'] = info['cpu']['name']
-
-                    if info['gpu']:
-                        pc_dict['GPU'] = info['gpu']['name']
-
-                    if info['motherboard']:
-                        pc_dict['Motherboard'] = info['motherboard']['name']
-
-                    if info['ram']:
-                        pc_dict['RAM'] = info['ram']['name']
-
-                    if info['storage']:
-                        # Show first storage device
-                        pc_dict['Storage'] = info['storage'][0]['name']
-                        # If multiple storage devices, add count
-                        if len(info['storage']) > 1:
-                            pc_dict['Storage'] += f" (+{len(info['storage'])-1} more)"
-
-                    self.pc_info = pc_dict
-
-                    # Update display
-                    self.root.after(0, lambda: self._update_hw_info_display(self._format_hw_info(pc_dict)))
+                # Update display
+                self.root.after(0, lambda: self._update_hw_info_display(self._format_hw_info(pc_dict)))
 
             except Exception as e:
                 error_msg = f"Failed to detect hardware:\n{str(e)}"
@@ -1230,6 +1342,10 @@ class CPUTempMonitorApp:
         self.config.set('check_interval', self.check_interval_var.get())
         self.config.set('notifications_enabled', self.notifications_var.get())
         self.config.set('threshold_std', self.threshold_var.get())
+        self.config.set('model_approach', self.model_approach_var.get())
+        self.config.set('last_model_type', self.model_type_var.get())
+        self.config.set('pca_type', self.pca_type_var.get())
+        self.config.set('pca_components', self.pca_components_var.get())
         self.config.set('multi_variable', self.multi_variable_var.get())
         self.config.set('collect_data_on_monitor', self.collect_data_var.get())
         self.config.set('collection_interval', self.collection_interval_var.get())

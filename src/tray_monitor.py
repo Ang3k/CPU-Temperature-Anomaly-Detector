@@ -12,7 +12,8 @@ from plyer import notification
 import pystray
 
 from .cpu_temp_bundled import HardwareMonitor
-from .core_regressor import CoreTempRegressor
+from .core_regressor import CoreTempRegressor, CoreTempPCA
+from .data_extractor import ComputerInfoExtractor
 
 
 def create_icon(color='green', size=64):
@@ -66,10 +67,14 @@ class TrayMonitor:
         self.current_temp = 0.0
         self.predicted_temp = 0.0
         self.last_diff = 0.0
+        self.reconstruction_error = 0.0
         self.anomaly_count = 0
         self.last_anomaly_time = None
         self.low_threshold = 0.0
         self.high_threshold = 0.0
+
+        # Model type detection
+        self.is_pca_model = False
 
         # Background data collection
         self.collected_data = []
@@ -80,11 +85,40 @@ class TrayMonitor:
         if path:
             self.model_path = path
         if self.model_path:
-            self.regressor = CoreTempRegressor.load_model(self.model_path)
+            # Check if it's a PCA model or regressor
+            loaded_model = None
+            try:
+                import joblib
+                loaded_model = joblib.load(self.model_path)
+            except Exception as e:
+                print(f"Error loading model: {e}")
+                return False
+
+            # Backward compatibility: Add extractor if not present
+            if not hasattr(loaded_model, 'extractor') or loaded_model.extractor is None:
+                # Create extractor with default parameters
+                extractor = ComputerInfoExtractor(
+                    scaler_type='standard',
+                    use_time_features=True,
+                    lag_steps=[1, 2, 3],
+                    rolling_windows=[3, 5, 7]
+                )
+                loaded_model.extractor = extractor
+
+            self.regressor = loaded_model
+
+            # Detect if this is a PCA model
+            self.is_pca_model = isinstance(loaded_model, CoreTempPCA)
+
+            # Initialize buffer for real-time detection
+            if hasattr(self.regressor, 'init_realtime_buffer'):
+                self.regressor.init_realtime_buffer()
+
             # Get thresholds from model
             if self.regressor.low_threshold is not None:
                 self.low_threshold = self.regressor.low_threshold
                 self.high_threshold = self.regressor.high_threshold
+
             return True
         return False
 
@@ -132,10 +166,18 @@ class TrayMonitor:
                     self.collected_data.append(data_point)
                     self.time_counter += 1
 
-                # Detect anomaly
-                is_anomaly, diff, predicted, actual = self.regressor.detect_anomaly(data)
-                self.last_diff = diff
-                self.predicted_temp = predicted
+                # Detect anomaly - handle both Regressor and PCA models
+                if self.is_pca_model:
+                    # PCA returns: (is_anomaly, reconstruction_error, threshold, actual)
+                    is_anomaly, recon_error, threshold, actual = self.regressor.detect_anomaly(data)
+                    self.reconstruction_error = recon_error
+                    self.last_diff = recon_error  # Use recon error as "diff" for display
+                    self.predicted_temp = 0.0  # PCA doesn't predict temperature
+                else:
+                    # Regressor returns: (is_anomaly, diff, predicted, actual)
+                    is_anomaly, diff, predicted, actual = self.regressor.detect_anomaly(data)
+                    self.last_diff = diff
+                    self.predicted_temp = predicted
 
                 # Update icon
                 self.update_icon(is_anomaly)
@@ -143,11 +185,19 @@ class TrayMonitor:
                 if is_anomaly:
                     self.anomaly_count += 1
                     self.last_anomaly_time = time.strftime('%H:%M:%S')
-                    self.send_notification(
-                        'CPU Temperature Anomaly!',
-                        f'Temp: {actual:.1f}°C (expected ~{predicted:.1f}°C)\n'
-                        f'Diff: {diff:+.1f}°C'
-                    )
+                    if self.is_pca_model:
+                        self.send_notification(
+                            'CPU Temperature Anomaly!',
+                            f'Temp: {actual:.1f}°C\n'
+                            f'Reconstruction Error: {recon_error:.4f}\n'
+                            f'Threshold: {self.high_threshold:.4f}'
+                        )
+                    else:
+                        self.send_notification(
+                            'CPU Temperature Anomaly!',
+                            f'Temp: {actual:.1f}°C (expected ~{predicted:.1f}°C)\n'
+                            f'Diff: {diff:+.1f}°C'
+                        )
 
             except Exception as e:
                 print(f"Monitor error: {e}")
@@ -191,17 +241,28 @@ class TrayMonitor:
     def get_status_text(self):
         """Get current status as text."""
         status = "Paused" if self.paused else "Monitoring"
-        # Calculate absolute temperature thresholds
-        low_temp = self.predicted_temp + self.low_threshold if self.predicted_temp else 0.0
-        high_temp = self.predicted_temp + self.high_threshold if self.predicted_temp else 0.0
+        model_type = "PCA" if self.is_pca_model else "Regressor"
 
-        status_text = (f"Status: {status}\n"
-                       f"CPU Temp: {self.current_temp:.1f}°C\n"
-                       f"Predicted: {self.predicted_temp:.1f}°C\n"
-                       f"Diff: {self.last_diff:+.1f}°C\n"
-                       f"Temp Range: [{low_temp:.1f}, {high_temp:.1f}]°C\n"
-                       f"Diff Range: [{self.low_threshold:.1f}, {self.high_threshold:+.1f}]°C\n"
-                       f"Anomalies: {self.anomaly_count}")
+        if self.is_pca_model:
+            # PCA model status
+            status_text = (f"Status: {status} ({model_type})\n"
+                           f"CPU Temp: {self.current_temp:.1f}°C\n"
+                           f"Recon Error: {self.reconstruction_error:.4f}\n"
+                           f"Error Threshold: [{self.low_threshold:.4f}, {self.high_threshold:.4f}]\n"
+                           f"Anomalies: {self.anomaly_count}")
+        else:
+            # Regressor model status
+            # Calculate absolute temperature thresholds
+            low_temp = self.predicted_temp + self.low_threshold if self.predicted_temp else 0.0
+            high_temp = self.predicted_temp + self.high_threshold if self.predicted_temp else 0.0
+
+            status_text = (f"Status: {status} ({model_type})\n"
+                           f"CPU Temp: {self.current_temp:.1f}°C\n"
+                           f"Predicted: {self.predicted_temp:.1f}°C\n"
+                           f"Diff: {self.last_diff:+.1f}°C\n"
+                           f"Temp Range: [{low_temp:.1f}, {high_temp:.1f}]°C\n"
+                           f"Diff Range: [{self.low_threshold:.1f}, {self.high_threshold:+.1f}]°C\n"
+                           f"Anomalies: {self.anomaly_count}")
 
         if self.collect_data:
             status_text += f"\nCollected Data: {len(self.collected_data)} samples"
@@ -253,20 +314,22 @@ class TrayMonitor:
         pause_text = "Resume" if self.paused else "Pause"
         collection_text = "Stop Data Collection" if self.collect_data else "Start Data Collection"
 
-        status_menu = pystray.Menu(
-            pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
-            pystray.MenuItem(lambda text: f"Predicted: {self.predicted_temp:.1f}°C", None, enabled=False),
-            pystray.MenuItem(lambda text: f"Diff: {self.last_diff:+.1f}°C", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(lambda text: f"Range: [{(self.predicted_temp or 0) + (self.low_threshold or 0):.1f}, {(self.predicted_temp or 0) + (self.high_threshold or 0):.1f}]°C", None, enabled=False),
-            pystray.MenuItem(lambda text: f"Diff Range: [{(self.low_threshold or 0):.1f}, {(self.high_threshold or 0):+.1f}]°C", None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
-        )
-
-        # Add data collection info to status if enabled
-        if self.collect_data:
-            status_menu = pystray.Menu(
+        # Build status menu based on model type
+        if self.is_pca_model:
+            # PCA model menu
+            status_items = [
+                pystray.MenuItem(lambda text: f"Model: PCA", None, enabled=False),
+                pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
+                pystray.MenuItem(lambda text: f"Recon Error: {self.reconstruction_error:.4f}", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(lambda text: f"Error Threshold: [{(self.low_threshold or 0):.4f}, {(self.high_threshold or 0):.4f}]", None, enabled=False),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
+            ]
+        else:
+            # Regressor model menu
+            status_items = [
+                pystray.MenuItem(lambda text: f"Model: Regressor", None, enabled=False),
                 pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
                 pystray.MenuItem(lambda text: f"Predicted: {self.predicted_temp:.1f}°C", None, enabled=False),
                 pystray.MenuItem(lambda text: f"Diff: {self.last_diff:+.1f}°C", None, enabled=False),
@@ -275,8 +338,13 @@ class TrayMonitor:
                 pystray.MenuItem(lambda text: f"Diff Range: [{(self.low_threshold or 0):.1f}, {(self.high_threshold or 0):+.1f}]°C", None, enabled=False),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
-                pystray.MenuItem(lambda text: f"Collected: {len(self.collected_data)} samples", None, enabled=False),
-            )
+            ]
+
+        # Add data collection info if enabled
+        if self.collect_data:
+            status_items.append(pystray.MenuItem(lambda text: f"Collected: {len(self.collected_data)} samples", None, enabled=False))
+
+        status_menu = pystray.Menu(*status_items)
 
         return pystray.Menu(
             pystray.MenuItem("Open GUI", on_open, default=True),
