@@ -46,7 +46,9 @@ class ConfigManager:
         'collection_interval': 5.0,
         'training_iterations': 1000,
         'training_interval': 1,
-        'mean_time': 0
+        'mean_time': 0,
+        'monitor_mean_time': 0,
+        'monitor_anomaly_window': 1
     }
 
     def __init__(self, config_path='config.yaml'):
@@ -117,6 +119,7 @@ class CPUTempMonitorApp:
         self.graph_predicted = deque(maxlen=self.graph_max_points)
         self.graph_diff = deque(maxlen=self.graph_max_points)
         self.graph_counter = 0
+        self.last_prediction_id = -1
 
         # Setup UI
         self.setup_ui()
@@ -336,6 +339,9 @@ class CPUTempMonitorApp:
         self.load_data_btn = ttk.Button(manual_data_frame, text="Load Training Data", command=self.load_training_data)
         self.load_data_btn.pack(side='left', padx=5)
 
+        self.load_multiple_btn = ttk.Button(manual_data_frame, text="Load & Combine CSVs", command=self.load_and_combine_csvs)
+        self.load_multiple_btn.pack(side='left', padx=5)
+
         # Progress
         progress_frame = ttk.LabelFrame(frame, text="Progress", padding=10)
         progress_frame.pack(fill='x', padx=10, pady=5)
@@ -402,13 +408,38 @@ class CPUTempMonitorApp:
         self.apply_threshold_btn = ttk.Button(model_frame, text="Apply Threshold", command=self.apply_threshold, state='disabled')
         self.apply_threshold_btn.grid(row=1, column=2, pady=2, padx=5)
 
+        # Mean time for monitor predictions
+        ttk.Label(model_frame, text="Mean Time (s):").grid(row=2, column=0, sticky='w', pady=2)
+        self.monitor_mean_time_var = tk.IntVar(value=self.config.get('monitor_mean_time', 0))
+        monitor_mean_spin = ttk.Spinbox(model_frame, from_=0, to=300, increment=1,
+                                        textvariable=self.monitor_mean_time_var, width=10)
+        monitor_mean_spin.grid(row=2, column=1, pady=2, padx=5, sticky='w')
+        ttk.Label(model_frame, text="(0 = no averaging; >0 = mean of X seconds)",
+                 font=('TkDefaultFont', 8), foreground='gray').grid(row=3, column=0, columnspan=3, sticky='w', pady=2)
+
+        # Anomaly window (consecutive points)
+        ttk.Label(model_frame, text="Anomaly Window (points):").grid(row=4, column=0, sticky='w', pady=2)
+        self.monitor_anomaly_window_var = tk.IntVar(value=self.config.get('monitor_anomaly_window', 1))
+        anomaly_window_spin = ttk.Spinbox(model_frame, from_=1, to=300, increment=1,
+                                          textvariable=self.monitor_anomaly_window_var, width=10)
+        anomaly_window_spin.grid(row=4, column=1, pady=2, padx=5, sticky='w')
+        self.anomaly_window_time_label = ttk.Label(model_frame, text="", foreground='gray')
+        self.anomaly_window_time_label.grid(row=4, column=2, sticky='w', pady=2)
+        ttk.Label(model_frame, text="(Requires N consecutive points over threshold)",
+                 font=('TkDefaultFont', 8), foreground='gray').grid(row=5, column=0, columnspan=3, sticky='w', pady=2)
+
         # Monitor data collection option
-        ttk.Label(model_frame, text="").grid(row=2, column=0, pady=2)  # Spacer
+        ttk.Label(model_frame, text="").grid(row=6, column=0, pady=2)  # Spacer
         self.collect_data_var = tk.BooleanVar(value=self.config.get('collect_data_on_monitor', False))
         collect_check = ttk.Checkbutton(model_frame,
                                         text="Also collect data during monitoring",
                                         variable=self.collect_data_var)
-        collect_check.grid(row=3, column=0, columnspan=3, sticky='w', pady=2)
+        collect_check.grid(row=7, column=0, columnspan=3, sticky='w', pady=2)
+
+        # Dynamic window time label updates
+        self.monitor_mean_time_var.trace_add('write', self.update_anomaly_window_time)
+        self.monitor_anomaly_window_var.trace_add('write', self.update_anomaly_window_time)
+        self.update_anomaly_window_time()
 
         # Buttons
         btn_frame = ttk.Frame(frame)
@@ -464,6 +495,49 @@ class CPUTempMonitorApp:
 
         self.status_text = tk.Text(status_frame, height=5, width=50, state='disabled', font=('Consolas', 9))
         self.status_text.pack(fill='x', pady=2)
+
+    def _format_duration(self, total_seconds: int) -> str:
+        """Format seconds into human-friendly text."""
+        total_seconds = max(0, int(round(total_seconds)))
+
+        if total_seconds < 60:
+            return f"{total_seconds} second" + ("s" if total_seconds != 1 else "")
+
+        minutes, seconds = divmod(total_seconds, 60)
+        if minutes < 60:
+            minutes_text = f"{minutes} minute" + ("s" if minutes != 1 else "")
+            if seconds:
+                seconds_text = f"{seconds} second" + ("s" if seconds != 1 else "")
+                return f"{minutes_text} {seconds_text}"
+            return minutes_text
+
+        hours, minutes = divmod(minutes, 60)
+        hours_text = f"{hours} hour" + ("s" if hours != 1 else "")
+        if minutes:
+            minutes_text = f"{minutes} minute" + ("s" if minutes != 1 else "")
+            return f"{hours_text} {minutes_text}"
+        return hours_text
+
+    def update_anomaly_window_time(self, *_):
+        """Update the displayed time for the anomaly window."""
+        if not hasattr(self, 'anomaly_window_time_label'):
+            return
+
+        try:
+            points = int(self.monitor_anomaly_window_var.get() or 1)
+        except Exception:
+            points = 1
+
+        try:
+            mean_time = int(self.monitor_mean_time_var.get() or 0)
+        except Exception:
+            mean_time = 0
+
+        points = max(1, points)
+        seconds_per_point = mean_time if mean_time > 0 else 1
+        total_seconds = points * seconds_per_point
+        formatted = self._format_duration(total_seconds)
+        self.anomaly_window_time_label.config(text=f"= {formatted}")
 
     def setup_settings_tab(self):
         """Setup the settings tab."""
@@ -911,6 +985,86 @@ class CPUTempMonitorApp:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load data:\n{e}")
 
+    def load_and_combine_csvs(self):
+        """Load and combine multiple CSV files for training."""
+        paths = filedialog.askopenfilenames(
+            initialdir='data' if os.path.exists('data') else '.',
+            title="Select Multiple CSV Files to Combine",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+
+        if not paths:
+            return
+
+        try:
+            import pandas as pd
+
+            # Load all CSV files
+            dfs = []
+            total_rows = 0
+            file_info = []
+
+            for path in paths:
+                df = pd.read_csv(path)
+
+                # Convert timestamp if present
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+                dfs.append(df)
+                rows = len(df)
+                total_rows += rows
+                file_info.append(f"  - {Path(path).name}: {rows} rows")
+
+            # Combine all dataframes
+            combined_df = pd.concat(dfs, ignore_index=True)
+
+            # Sort by timestamp if available
+            if 'timestamp' in combined_df.columns:
+                combined_df = combined_df.sort_values('timestamp').reset_index(drop=True)
+                # Recreate sequential time column
+                if 'time' in combined_df.columns:
+                    combined_df['time'] = range(len(combined_df))
+
+            # Apply mean_time resampling if specified
+            mean_time = self.mean_time_var.get()
+            if mean_time > 0 and 'timestamp' in combined_df.columns:
+                original_rows = len(combined_df)
+                combined_df = combined_df.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
+                # Recreate sequential time column after resampling
+                if 'time' in combined_df.columns:
+                    combined_df['time'] = range(len(combined_df))
+                final_rows = len(combined_df)
+                resample_msg = f"\n\nResampled from {original_rows} to {final_rows} rows using {mean_time}s window"
+            else:
+                final_rows = len(combined_df)
+                resample_msg = ""
+
+            self.training_data_df = combined_df
+            self.update_train_from_data_state()
+
+            # Build info message
+            info_msg = (f"Combined {len(paths)} CSV files:\n" +
+                       "\n".join(file_info) +
+                       f"\n\nTotal: {total_rows} rows combined" +
+                       (f" → {final_rows} rows after sorting" if final_rows != total_rows else "") +
+                       resample_msg)
+
+            # Ask if should train immediately
+            should_train = messagebox.askyesno(
+                "Data Combined",
+                info_msg + "\n\nTrain model with this combined data now?"
+            )
+
+            if should_train:
+                self.train_from_existing_data()
+            else:
+                self.progress_label.config(text=f"Combined {len(paths)} files ({final_rows} rows) - ready to train")
+                self.save_data_btn.config(state='normal')
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to combine CSV files:\n{e}")
+
     def start_monitoring(self):
         """Start the monitoring process."""
         model_path = self.model_path_var.get()
@@ -931,7 +1085,9 @@ class CPUTempMonitorApp:
                 notifications_enabled=self.notifications_var.get(),
                 on_open_gui=self.show_window,
                 on_quit_app=self.quit_application,
-                collect_data=self.collect_data_var.get()
+                collect_data=self.collect_data_var.get(),
+                mean_time=self.monitor_mean_time_var.get(),
+                anomaly_window=self.monitor_anomaly_window_var.get()
             )
             self.tray_monitor.load_model()
             self.tray_monitor.start_monitoring()
@@ -941,6 +1097,7 @@ class CPUTempMonitorApp:
             self.stop_monitor_btn.config(state='normal')
             self.minimize_btn.config(state='normal')
             self.apply_threshold_btn.config(state='normal')
+            self.last_prediction_id = -1
 
             # Update status periodically
             self.update_status()
@@ -963,8 +1120,13 @@ class CPUTempMonitorApp:
         self.status_text.insert(tk.END, status)
         self.status_text.config(state='disabled')
 
-        # Update graph data
-        if self.tray_monitor.current_temp > 0:
+        prediction_id = getattr(self.tray_monitor, 'prediction_counter', 0)
+        new_prediction = prediction_id != self.last_prediction_id
+        if new_prediction:
+            self.last_prediction_id = prediction_id
+
+        # Update graph data only when new prediction is available
+        if new_prediction and self.tray_monitor.current_temp > 0:
             self.graph_times.append(self.graph_counter)
             self.graph_actual.append(self.tray_monitor.current_temp)
             self.graph_predicted.append(self.tray_monitor.predicted_temp)
@@ -1352,6 +1514,8 @@ class CPUTempMonitorApp:
         self.config.set('training_iterations', self.iterations_var.get())
         self.config.set('training_interval', self.interval_var.get())
         self.config.set('mean_time', self.mean_time_var.get())
+        self.config.set('monitor_mean_time', self.monitor_mean_time_var.get())
+        self.config.set('monitor_anomaly_window', self.monitor_anomaly_window_var.get())
         self.config.save()
         messagebox.showinfo("Settings", "Settings saved successfully")
 

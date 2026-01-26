@@ -19,7 +19,7 @@ class ComputerInfoExtractor:
     Separates data collection concerns from model training.
     """
 
-    def __init__(self, scaler_type='standard', use_time_features=True, lag_steps=[1,2,3], rolling_windows=[3,5,7]):
+    def __init__(self, scaler_type='standard', use_time_features=True, lag_steps = [1, 2, 4, 8, 12], rolling_windows = [6, 12, 24, 36]):
         self.data = pd.DataFrame()
         self.pc_info = {}
         self.scaler_type = scaler_type

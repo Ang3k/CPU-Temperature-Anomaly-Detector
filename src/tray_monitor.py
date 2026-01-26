@@ -5,6 +5,7 @@ Provides background monitoring with Windows notifications.
 
 import threading
 import time
+from collections import deque
 from io import BytesIO
 
 from PIL import Image, ImageDraw
@@ -47,7 +48,8 @@ class TrayMonitor:
 
     def __init__(self, model_path: str = None, check_interval: float = 5.0,
                  threshold_std: float = 1.5, notifications_enabled: bool = True,
-                 on_open_gui=None, on_quit_app=None, collect_data: bool = False):
+                 on_open_gui=None, on_quit_app=None, collect_data: bool = False,
+                 mean_time: int = 0, anomaly_window: int = 1):
         self.model_path = model_path
         self.check_interval = check_interval
         self.threshold_std = threshold_std
@@ -55,6 +57,9 @@ class TrayMonitor:
         self.on_open_gui = on_open_gui
         self.on_quit_app = on_quit_app
         self.collect_data = collect_data
+        self.mean_time = max(0, int(mean_time or 0))
+        self.sample_interval = 1.0 if self.mean_time > 0 else self.check_interval
+        self.anomaly_window = max(1, int(anomaly_window or 1))
 
         self.regressor = None
         self.monitor = None
@@ -79,6 +84,67 @@ class TrayMonitor:
         # Background data collection
         self.collected_data = []
         self.time_counter = 0
+
+        # Mean prediction buffering
+        self.mean_buffer = []
+        self.prediction_counter = 0
+        self.anomaly_window_buffer = deque(maxlen=self.anomaly_window)
+
+    def _average_buffer(self, buffer: list) -> dict:
+        """Average numeric values in a list of sensor dicts."""
+        if not buffer:
+            return {}
+
+        sums = {}
+        counts = {}
+        for sample in buffer:
+            for key, value in sample.items():
+                if isinstance(value, (int, float)) and value is not None:
+                    sums[key] = sums.get(key, 0.0) + float(value)
+                    counts[key] = counts.get(key, 0) + 1
+
+        return {key: (sums[key] / counts[key]) for key in sums}
+
+    def _process_prediction(self, data: dict):
+        """Run anomaly detection on provided data and update state."""
+        if self.is_pca_model:
+            # PCA returns: (is_anomaly, reconstruction_error, threshold, actual)
+            is_anomaly_raw, recon_error, threshold, actual = self.regressor.detect_anomaly(data)
+            self.reconstruction_error = recon_error
+            self.last_diff = recon_error  # Use recon error as "diff" for display
+            self.predicted_temp = 0.0  # PCA doesn't predict temperature
+        else:
+            # Regressor returns: (is_anomaly, diff, predicted, actual)
+            is_anomaly_raw, diff, predicted, actual = self.regressor.detect_anomaly(data)
+            self.last_diff = diff
+            self.predicted_temp = predicted
+
+        self.current_temp = actual
+        self.prediction_counter += 1
+
+        self.anomaly_window_buffer.append(bool(is_anomaly_raw))
+        window_ready = len(self.anomaly_window_buffer) >= self.anomaly_window
+        is_anomaly_confirmed = window_ready and all(self.anomaly_window_buffer)
+
+        # Update icon
+        self.update_icon(is_anomaly_confirmed)
+
+        if is_anomaly_confirmed:
+            self.anomaly_count += 1
+            self.last_anomaly_time = time.strftime('%H:%M:%S')
+            if self.is_pca_model:
+                self.send_notification(
+                    'CPU Temperature Anomaly!',
+                    f'Temp: {actual:.1f}Â°C\n'
+                    f'Reconstruction Error: {recon_error:.4f}\n'
+                    f'Threshold: {self.high_threshold:.4f}'
+                )
+            else:
+                self.send_notification(
+                    'CPU Temperature Anomaly!',
+                    f'Temp: {actual:.1f}Â°C (expected ~{predicted:.1f}Â°C)\n'
+                    f'Diff: {diff:+.1f}Â°C'
+                )
 
     def load_model(self, path: str = None):
         """Load the trained model."""
@@ -156,53 +222,29 @@ class TrayMonitor:
             try:
                 # Get current sensor data
                 data = self.monitor.get_essential_fast()
-                self.current_temp = data.get('cpu_temp', 0.0)
+                sample_time = datetime.now()
 
                 # Collect data in background if enabled
                 if self.collect_data:
                     data_point = data.copy()
-                    data_point['timestamp'] = datetime.now()
+                    data_point['timestamp'] = sample_time
                     data_point['time'] = self.time_counter
                     self.collected_data.append(data_point)
                     self.time_counter += 1
 
-                # Detect anomaly - handle both Regressor and PCA models
-                if self.is_pca_model:
-                    # PCA returns: (is_anomaly, reconstruction_error, threshold, actual)
-                    is_anomaly, recon_error, threshold, actual = self.regressor.detect_anomaly(data)
-                    self.reconstruction_error = recon_error
-                    self.last_diff = recon_error  # Use recon error as "diff" for display
-                    self.predicted_temp = 0.0  # PCA doesn't predict temperature
+                # Detect anomaly using raw or averaged data
+                if self.mean_time > 0:
+                    self.mean_buffer.append(data)
+                    if len(self.mean_buffer) >= self.mean_time:
+                        mean_data = self._average_buffer(self.mean_buffer)
+                        self.mean_buffer = []
+                        self._process_prediction(mean_data)
                 else:
-                    # Regressor returns: (is_anomaly, diff, predicted, actual)
-                    is_anomaly, diff, predicted, actual = self.regressor.detect_anomaly(data)
-                    self.last_diff = diff
-                    self.predicted_temp = predicted
-
-                # Update icon
-                self.update_icon(is_anomaly)
-
-                if is_anomaly:
-                    self.anomaly_count += 1
-                    self.last_anomaly_time = time.strftime('%H:%M:%S')
-                    if self.is_pca_model:
-                        self.send_notification(
-                            'CPU Temperature Anomaly!',
-                            f'Temp: {actual:.1f}°C\n'
-                            f'Reconstruction Error: {recon_error:.4f}\n'
-                            f'Threshold: {self.high_threshold:.4f}'
-                        )
-                    else:
-                        self.send_notification(
-                            'CPU Temperature Anomaly!',
-                            f'Temp: {actual:.1f}°C (expected ~{predicted:.1f}°C)\n'
-                            f'Diff: {diff:+.1f}°C'
-                        )
-
+                    self._process_prediction(data)
             except Exception as e:
                 print(f"Monitor error: {e}")
 
-            time.sleep(self.check_interval)
+            time.sleep(self.sample_interval)
 
         # Cleanup
         if self.monitor:

@@ -82,31 +82,32 @@ class CoreTempRegressor:
 
         model_dict = {
             'xgb': XGBRegressor(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1,
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.05,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                min_child_weight=3,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
-                random_state=42
+                min_child_weight=10,
+                reg_alpha=0.5,
+                reg_lambda=2.0,
+                random_state=42,
+                tree_method='hist'
             ),
             'linear': Ridge(
-                alpha=1.0,
+                alpha=10.0,
                 solver='auto',
                 random_state=42
             ),
             'lightgbm': LGBMRegressor(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.1,
-                num_leaves=7,
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.05,
+                num_leaves=31,
                 subsample=0.8,
                 colsample_bytree=0.8,
-                min_child_samples=20,
-                reg_alpha=0.1,
-                reg_lambda=1.0,
+                min_child_samples=100,
+                reg_alpha=0.5,
+                reg_lambda=2.0,
                 random_state=42,
                 verbose=-1
             ),
@@ -382,11 +383,11 @@ class CoreTempRegressor:
             extractor = ComputerInfoExtractor(
                 scaler_type='standard',
                 use_time_features=getattr(model, 'use_time_features', True),
-                lag_steps=getattr(model, 'lag_steps', [1, 2, 3]),
-                rolling_windows=getattr(model, 'rolling_windows', [3, 5, 7])
+                lag_steps=getattr(model, 'lag_steps', [1, 2, 4, 8, 12]),
+                rolling_windows=getattr(model, 'rolling_windows', [6, 12, 24, 36])
             )
             model.extractor = extractor
-
+            
         # Initialize buffer for real-time detection if extractor exists
         if model.extractor and hasattr(model, 'init_realtime_buffer'):
             try:
@@ -764,9 +765,7 @@ class CoreTempPCA:
             # Create extractor with default parameters
             extractor = ComputerInfoExtractor(
                 scaler_type='standard',
-                use_time_features=getattr(model, 'use_time_features', True),
-                lag_steps=[1, 2, 3],
-                rolling_windows=[3, 5, 7]
+                use_time_features=getattr(model, 'use_time_features', True), lag_steps = [1, 2, 4, 8, 12], rolling_windows = [6, 12, 24, 36]
             )
             model.extractor = extractor
 
