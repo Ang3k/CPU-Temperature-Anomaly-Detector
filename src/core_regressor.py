@@ -43,6 +43,8 @@ class CoreTempRegressor:
         self.predict_data = None
 
         # Store for predictions
+        self.x_train = None
+        self.y_train = None
         self.x_test = None
         self.y_test = None
         self.y_pred = None
@@ -150,23 +152,23 @@ class CoreTempRegressor:
         exclude_cols = ['cpu_temp', 'time', 'fan_rpm', 'timestamp']
         if self.multi_variable:
             feature_cols = [col for col in train_data.columns if col not in exclude_cols]
-            x_train = train_data[feature_cols]
-            y_train = train_data['cpu_temp']
+            self.x_train = train_data[feature_cols]
+            self.y_train = train_data['cpu_temp']
 
             self.x_test = test_data[feature_cols]
             self.y_test = test_data['cpu_temp']
         else:
-            x_train = train_data[['time']]
-            y_train = train_data['cpu_temp']
+            self.x_train = train_data[['time']]
+            self.y_train = train_data['cpu_temp']
 
             self.x_test = test_data[['time']]
             self.y_test = test_data['cpu_temp']
 
         # Store feature columns for later use
-        self.feature_columns = list(x_train.columns)
+        self.feature_columns = list(self.x_train.columns)
 
         # Fit scaler ONLY on training data (prevents data leakage)
-        x_train_scaled = self.scaler.fit_transform(x_train)
+        x_train_scaled = self.scaler.fit_transform(self.x_train)
         x_test_scaled = self.scaler.transform(self.x_test)
 
         # Train model
@@ -210,6 +212,71 @@ class CoreTempRegressor:
         std_diff = np.std(diff)
         self.low_threshold = mean_diff - threshold_std * std_diff
         self.high_threshold = mean_diff + threshold_std * std_diff
+
+    def calculate_PSI(self, n_bins=11, plot=False):
+        """
+        Calculate Population Stability Index (PSI) for drift detection.
+
+        PSI measures distribution shift between training and test data.
+        Values interpretation:
+        - PSI < 0.1: No significant change
+        - 0.1 <= PSI < 0.2: Moderate change
+        - PSI >= 0.2: Significant change (model may need retraining)
+
+        Args:
+            n_bins: Number of bins for histogram (default: 11)
+            plot: Whether to show bar plot of PSI values (default: False)
+
+        Returns:
+            dict: PSI value for each original feature
+        """
+        original_features = [
+            'cpu_load', 'cpu_power', 'cpu_clock', 'cpu_volt',
+            'gpu_temp', 'gpu_load', 'gpu_power',
+            'mb_temp', 'ram_load'
+        ]
+
+        if self.x_train is None or self.x_test is None:
+            raise ValueError("Model not trained. Run fit_predict() first.")
+
+        columns = [col for col in original_features if col in self.x_train.columns]
+        psi_cols_dict = {}
+
+        for column in columns:
+            list_train = self.x_train[column].to_list()
+            list_test = self.x_test[column].to_list()
+
+            bins = np.linspace(min(list_train), max(list_train), num=n_bins)
+
+            hist_train, _ = np.histogram(list_train, bins=bins)
+            hist_test, _ = np.histogram(list_test, bins=bins)
+
+            pct_train = hist_train / hist_train.sum()
+            pct_test = hist_test / hist_test.sum()
+
+            eps = 0.0001
+            pct_train = pct_train + eps
+            pct_test = pct_test + eps
+
+            psi_per_bin = (pct_test - pct_train) * np.log(pct_test / pct_train)
+            psi_value = np.sum(psi_per_bin)
+            psi_cols_dict[column] = psi_value
+
+        if plot:
+            psi_df = pd.DataFrame(list(psi_cols_dict.items()), columns=['Feature', 'PSI'])
+            fig = px.bar(psi_df, x='Feature', y='PSI',
+                        title='Population Stability Index (PSI) for Each Feature',
+                        color='PSI',
+                        color_continuous_scale='RdYlGn_r')
+            fig.add_hline(y=0.1, line_dash='dash', line_color='orange',
+                         annotation_text='Moderate Change (0.1)',
+                         annotation_position='top left')
+            fig.add_hline(y=0.2, line_dash='dash', line_color='red',
+                         annotation_text='Significant Change (0.2)',
+                         annotation_position='top left')
+            fig.show()
+
+        return psi_cols_dict
 
     def init_realtime_buffer(self):
         """Initialize the buffer for real-time anomaly detection."""
@@ -422,6 +489,8 @@ class CoreTempPCA:
         self.data = None
 
         # Store for predictions/reconstruction
+        self.x_train = None
+        self.y_train = None
         self.x_test = None
         self.y_test = None
         self.reconstruction_error = None
@@ -514,23 +583,23 @@ class CoreTempPCA:
         exclude_cols = ['cpu_temp', 'time', 'fan_rpm', 'timestamp']
         if self.multi_variable:
             feature_cols = [col for col in train_data.columns if col not in exclude_cols]
-            x_train = train_data[feature_cols]
-            y_train = train_data['cpu_temp']
+            self.x_train = train_data[feature_cols]
+            self.y_train = train_data['cpu_temp']
 
             self.x_test = test_data[feature_cols]
             self.y_test = test_data['cpu_temp']
         else:
-            x_train = train_data[['time']]
-            y_train = train_data['cpu_temp']
+            self.x_train = train_data[['time']]
+            self.y_train = train_data['cpu_temp']
 
             self.x_test = test_data[['time']]
             self.y_test = test_data['cpu_temp']
 
         # Store feature columns for later use
-        self.feature_columns = list(x_train.columns)
+        self.feature_columns = list(self.x_train.columns)
 
         # Step 1: Fit scaler ONLY on training data (prevents data leakage)
-        x_train_scaled = self.scaler.fit_transform(x_train)
+        x_train_scaled = self.scaler.fit_transform(self.x_train)
         x_test_scaled = self.scaler.transform(self.x_test)
 
         # Step 2: Fit PCA ONLY on scaled training data (healthy data)
@@ -656,6 +725,71 @@ class CoreTempPCA:
         std_error = np.std(self.reconstruction_error)
         self.low_threshold = mean_error - threshold_std * std_error
         self.high_threshold = mean_error + threshold_std * std_error
+
+    def calculate_PSI(self, n_bins=11, plot=False):
+        """
+        Calculate Population Stability Index (PSI) for drift detection.
+
+        PSI measures distribution shift between training and test data.
+        Values interpretation:
+        - PSI < 0.1: No significant change
+        - 0.1 <= PSI < 0.2: Moderate change
+        - PSI >= 0.2: Significant change (model may need retraining)
+
+        Args:
+            n_bins: Number of bins for histogram (default: 11)
+            plot: Whether to show bar plot of PSI values (default: False)
+
+        Returns:
+            dict: PSI value for each original feature
+        """
+        original_features = [
+            'cpu_load', 'cpu_power', 'cpu_clock', 'cpu_volt',
+            'gpu_temp', 'gpu_load', 'gpu_power',
+            'mb_temp', 'ram_load'
+        ]
+
+        if self.x_train is None or self.x_test is None:
+            raise ValueError("Model not trained. Run fit_predict() first.")
+
+        columns = self.x_train[original_features].columns.to_list()
+        psi_cols_dict = {}
+
+        for column in columns:
+            list_train = self.x_train[column].to_list()
+            list_test = self.x_test[column].to_list()
+
+            bins = np.linspace(min(list_train), max(list_train), num=n_bins)
+
+            hist_train, _ = np.histogram(list_train, bins=bins)
+            hist_test, _ = np.histogram(list_test, bins=bins)
+
+            pct_train = hist_train / hist_train.sum()
+            pct_test = hist_test / hist_test.sum()
+
+            eps = 0.0001
+            pct_train = pct_train + eps
+            pct_test = pct_test + eps
+
+            psi_per_bin = (pct_test - pct_train) * np.log(pct_test / pct_train)
+            psi_value = np.sum(psi_per_bin)
+            psi_cols_dict[column] = psi_value
+
+        if plot:
+            psi_df = pd.DataFrame(list(psi_cols_dict.items()), columns=['Feature', 'PSI'])
+            fig = px.bar(psi_df, x='Feature', y='PSI',
+                        title='Population Stability Index (PSI) for Each Feature',
+                        color='PSI',
+                        color_continuous_scale='RdYlGn_r')
+            fig.add_hline(y=0.1, line_dash='dash', line_color='orange',
+                         annotation_text='Moderate Change (0.1)',
+                         annotation_position='top left')
+            fig.add_hline(y=0.2, line_dash='dash', line_color='red',
+                         annotation_text='Significant Change (0.2)',
+                         annotation_position='top left')
+            fig.show()
+
+        return psi_cols_dict
 
     def plot_predictions(self):
         """Plot reconstruction error and anomaly detection results."""

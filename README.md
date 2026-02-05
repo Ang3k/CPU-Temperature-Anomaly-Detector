@@ -9,17 +9,20 @@ cpu_temp_detector/
 ├── src/                    # Código fonte
 │   ├── __init__.py
 │   ├── cpu_temp_bundled.py     # Interface com LibreHardwareMonitor
-│   ├── core_regressor.py       # Classe de regressão e detecção de anomalias
+│   ├── core_regressor.py       # Modelos de regressão e PCA para detecção de anomalias
+│   ├── data_extractor.py       # Extração e engenharia de features
 │   ├── tray_monitor.py         # Monitor de bandeja do sistema
 │   └── lib/                    # DLLs do LibreHardwareMonitor
 │       ├── HidSharp.dll
 │       └── LibreHardwareMonitorLib.dll
 ├── data/                   # Dados de treino
-│   └── data.csv
+│   └── *.csv
 ├── models/                 # Modelos treinados (.joblib)
 │   ├── cpu_temp_model_linear.joblib
 │   ├── cpu_temp_model_xgb.joblib
-│   └── cpu_temp_model_lightgbm.joblib
+│   ├── cpu_temp_model_lightgbm.joblib
+│   ├── cpu_temp_model_pca.joblib
+│   └── cpu_temp_model_kernel_pca.joblib
 ├── notebooks/              # Jupyter notebooks (experimentação)
 │   └── cpu_temp.ipynb
 ├── app.py                  # Aplicativo GUI principal
@@ -52,17 +55,21 @@ python app.py
 ### 2. Treine um Modelo
 
 Na aba **Train**:
-- Selecione o tipo de modelo (linear, xgb, lightgbm)
-- Configure o número de iterações e intervalo
-- Clique em "Start Training"
-- Aguarde a coleta de dados e treinamento
+- Selecione a abordagem: **Regressor** (regressão) ou **PCA** (erro de reconstrução)
+- Para Regressor: escolha o modelo (Linear, XGBoost, LightGBM)
+- Para PCA: escolha entre PCA ou Kernel PCA e configure o número de componentes
+- Selecione o scaler (Standard, MinMax, Robust)
+- Colete dados usando a **coleta em background** ou carregue de **arquivo(s) CSV**
+- Opcionalmente, defina **mean time** para reamostrar os dados por janelas de tempo
+- Clique em "Train From Data"
 - Clique em "Save Model" quando terminar
 
 ### 3. Inicie o Monitoramento
 
 Na aba **Monitor**:
-- Selecione o modelo treinado (`.joblib`)
+- Selecione o modelo treinado (`.joblib`) — detecta automaticamente se é Regressor ou PCA
 - Configure o threshold de anomalia (padrão: 1.5 std)
+- Configure a **janela de anomalia** (número de anomalias consecutivas antes de alertar)
 - Clique em "Start Monitoring"
 - Minimize para a bandeja do sistema
 
@@ -80,24 +87,40 @@ Edite `config.yaml` ou use a aba **Settings** na GUI:
 
 ```yaml
 model_path: models/cpu_temp_model_lightgbm.joblib
+model_approach: regressor          # 'regressor' ou 'pca'
 threshold_std: 1.5
 check_interval: 5
+mean_time: 5                       # Janela de reamostragem em segundos (opcional)
+monitor_anomaly_window: 1          # Anomalias consecutivas para confirmar alerta
+multi_variable: true               # Usar todos os sensores ou apenas tempo
+pca_components: 25                 # Componentes para PCA
 notifications_enabled: true
 minimize_to_tray: true
 ```
 
 ## Como Funciona
 
-1. **Coleta de Dados**: Usa LibreHardwareMonitor para ler sensores (CPU, GPU, RAM, etc.)
-2. **Feature Engineering**: Cria features de lag, rolling statistics, e diferenças
-3. **Treinamento**: Treina um modelo de regressão para prever temperatura normal
-4. **Detecção**: Compara temperatura real vs prevista - se diferença > threshold, alerta
+1. **Coleta de Dados**: Coleta em background ou carregamento de CSVs (sensores via LibreHardwareMonitor)
+2. **Reamostragem** (opcional): Agrega dados por janelas de tempo (mean time)
+3. **Feature Engineering**: Cria features de lag, rolling statistics, e diferenças
+4. **Treinamento**: Treina modelo de regressão ou PCA para detectar comportamento normal
+5. **Detecção**: Identifica anomalias quando a diferença (ou erro de reconstrução) excede o threshold
+6. **Janela de Anomalia**: Requer N anomalias consecutivas antes de alertar, evitando falsos positivos
 
-## Modelos Disponíveis
+## Abordagens de Detecção
+
+### Regressão
+Prevê a temperatura "normal" da CPU com base nos outros sensores. Anomalias são detectadas quando `|real - previsto| > threshold`.
 
 - **Linear (Ridge)**: Rápido, simples, bom baseline
 - **XGBoost**: Ótimo para padrões complexos
 - **LightGBM**: Balanceado entre velocidade e precisão (recomendado)
+
+### PCA (Análise de Componentes Principais)
+Usa erro de reconstrução para detectar anomalias. Dados que não se encaixam no padrão aprendido geram alto erro de reconstrução.
+
+- **PCA**: Redução de dimensionalidade linear
+- **Kernel PCA**: Redução não-linear (kernel RBF), captura relações mais complexas
 
 ## Desenvolvimento
 
@@ -119,7 +142,7 @@ Execute o Python/terminal como Administrador.
 
 ### Modelo não detecta anomalias
 - Aumente o threshold_std nas configurações
-- Treine com mais dados (mais iterações)
+- Treine com mais dados (colete por mais tempo ou combine mais CSVs)
 - Verifique se os dados de treino são representativos
 
 ### Notificações não aparecem

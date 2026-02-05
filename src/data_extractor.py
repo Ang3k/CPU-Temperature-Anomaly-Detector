@@ -1,7 +1,3 @@
-# Standard library imports
-from datetime import datetime
-from time import sleep
-
 # Third-party imports
 import pandas as pd
 import plotly.express as px
@@ -27,42 +23,18 @@ class ComputerInfoExtractor:
         self.lag_steps = lag_steps
         self.rolling_windows = rolling_windows
 
-    def extract_CPU_data(self, iterations=100, interval=5, mean_time=None, csv=False, progress_callback=None, should_stop_callback=None):
+    def extract_CPU_data(self, mean_time=None, csv=False):
         """
-        Extract CPU data for training.
+        Load CPU data for training from CSV.
 
         Args:
-            iterations: Number of data points to collect
-            interval: Time between collections (seconds)
             mean_time: Optional time window (seconds) for resampling and averaging data. None = no resampling
             csv: If True, load from '../data/new_latest.csv'
-            progress_callback: Optional callback function(current, total) for progress updates
-            should_stop_callback: Optional callback function() that returns True to stop collection
         """
         if csv:
             self.data = pd.read_csv('../data/new_latest.csv')
             if 'timestamp' in self.data.columns:
                 self.data['timestamp'] = pd.to_datetime(self.data['timestamp'])
-        else:
-            data_list = []
-            with HardwareMonitor() as monitor:
-                for t in range(iterations):
-                    # Check if should stop
-                    if should_stop_callback and should_stop_callback():
-                        break
-
-                    row = monitor.get_essential_fast()
-                    row['timestamp'] = datetime.now()
-                    row['time'] = t
-                    data_list.append(row)
-
-                    if progress_callback:
-                        progress_callback(t + 1, iterations)
-
-                    if interval > 0:
-                        sleep(interval)
-
-            self.data = pd.DataFrame(data_list)
 
         if mean_time not in (None, 0):
             self.data = self.data.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
@@ -134,10 +106,10 @@ class ComputerInfoExtractor:
 
         return df
 
-    def extract_data_pipeline(self, csv=False, iterations=100, interval=5, mean_time=None, progress_callback=None, should_stop_callback=None):
+    def extract_data_pipeline(self, csv=False, mean_time=None):
         """Full data extraction and preprocessing pipeline."""
         if self.data.empty:
-            self.extract_CPU_data(iterations=iterations, interval=interval, mean_time=mean_time, csv=csv, progress_callback=progress_callback, should_stop_callback=should_stop_callback)
+            self.extract_CPU_data(mean_time=mean_time, csv=csv)
 
         if self.use_time_features:
             df = self.create_time_features_on_df()

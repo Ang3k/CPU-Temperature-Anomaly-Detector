@@ -48,7 +48,7 @@ class TrayMonitor:
 
     def __init__(self, model_path: str = None, check_interval: float = 5.0,
                  threshold_std: float = 1.5, notifications_enabled: bool = True,
-                 on_open_gui=None, on_quit_app=None, collect_data: bool = False,
+                 on_open_gui=None, on_quit_app=None,
                  mean_time: int = 0, anomaly_window: int = 1):
         self.model_path = model_path
         self.check_interval = check_interval
@@ -56,7 +56,6 @@ class TrayMonitor:
         self.notifications_enabled = notifications_enabled
         self.on_open_gui = on_open_gui
         self.on_quit_app = on_quit_app
-        self.collect_data = collect_data
         self.mean_time = max(0, int(mean_time or 0))
         self.sample_interval = 1.0 if self.mean_time > 0 else self.check_interval
         self.anomaly_window = max(1, int(anomaly_window or 1))
@@ -80,10 +79,6 @@ class TrayMonitor:
 
         # Model type detection
         self.is_pca_model = False
-
-        # Background data collection
-        self.collected_data = []
-        self.time_counter = 0
 
         # Mean prediction buffering
         self.mean_buffer = []
@@ -222,15 +217,6 @@ class TrayMonitor:
             try:
                 # Get current sensor data
                 data = self.monitor.get_essential_fast()
-                sample_time = datetime.now()
-
-                # Collect data in background if enabled
-                if self.collect_data:
-                    data_point = data.copy()
-                    data_point['timestamp'] = sample_time
-                    data_point['time'] = self.time_counter
-                    self.collected_data.append(data_point)
-                    self.time_counter += 1
 
                 # Detect anomaly using raw or averaged data
                 if self.mean_time > 0:
@@ -306,30 +292,7 @@ class TrayMonitor:
                            f"Diff Range: [{self.low_threshold:.1f}, {self.high_threshold:+.1f}]°C\n"
                            f"Anomalies: {self.anomaly_count}")
 
-        if self.collect_data:
-            status_text += f"\nCollected Data: {len(self.collected_data)} samples"
-
         return status_text
-
-    def save_collected_data(self, filepath: str):
-        """Save collected data to CSV file."""
-        import pandas as pd
-        if not self.collected_data:
-            return False
-
-        df = pd.DataFrame(self.collected_data)
-        df.to_csv(filepath, index=False)
-        return True
-
-    def clear_collected_data(self):
-        """Clear collected data and reset counter."""
-        self.collected_data = []
-        self.time_counter = 0
-
-    def toggle_data_collection(self):
-        """Toggle background data collection on/off."""
-        self.collect_data = not self.collect_data
-        return self.collect_data
 
     def create_menu(self):
         """Create the system tray menu."""
@@ -342,11 +305,6 @@ class TrayMonitor:
             # Update menu item text
             self.icon.menu = self.create_menu()
 
-        def on_toggle_collection(icon, item):
-            self.toggle_data_collection()
-            # Update menu item text
-            self.icon.menu = self.create_menu()
-
         def on_quit(icon, item):
             self.stop_monitoring()
             icon.stop()
@@ -354,7 +312,6 @@ class TrayMonitor:
                 self.on_quit_app()
 
         pause_text = "Resume" if self.paused else "Pause"
-        collection_text = "Stop Data Collection" if self.collect_data else "Start Data Collection"
 
         # Build status menu based on model type
         if self.is_pca_model:
@@ -382,16 +339,11 @@ class TrayMonitor:
                 pystray.MenuItem(lambda text: f"Anomalies: {self.anomaly_count}", None, enabled=False),
             ]
 
-        # Add data collection info if enabled
-        if self.collect_data:
-            status_items.append(pystray.MenuItem(lambda text: f"Collected: {len(self.collected_data)} samples", None, enabled=False))
-
         status_menu = pystray.Menu(*status_items)
 
         return pystray.Menu(
             pystray.MenuItem("Open GUI", on_open, default=True),
             pystray.MenuItem(pause_text, on_pause),
-            pystray.MenuItem(collection_text, on_toggle_collection),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Status", status_menu),
             pystray.Menu.SEPARATOR,

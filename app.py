@@ -42,10 +42,7 @@ class ConfigManager:
         'pca_components': 5,
         'last_scaler': 'standard',
         'multi_variable': True,
-        'collect_data_on_monitor': False,
         'collection_interval': 5.0,
-        'training_iterations': 1000,
-        'training_interval': 1,
         'mean_time': 0,
         'monitor_mean_time': 0,
         'monitor_anomaly_window': 1
@@ -251,26 +248,14 @@ class CPUTempMonitorApp:
         param_frame = ttk.LabelFrame(frame, text="Training Parameters", padding=10)
         param_frame.pack(fill='x', padx=10, pady=5)
 
-        ttk.Label(param_frame, text="Iterations:").grid(row=0, column=0, sticky='w', pady=2)
-        self.iterations_var = tk.IntVar(value=self.config.get('training_iterations', 1000))
-        iterations_spin = ttk.Spinbox(param_frame, from_=100, to=100000, increment=100,
-                                      textvariable=self.iterations_var, width=10)
-        iterations_spin.grid(row=0, column=1, pady=2, padx=5)
-
-        ttk.Label(param_frame, text="Interval (s):").grid(row=1, column=0, sticky='w', pady=2)
-        self.interval_var = tk.DoubleVar(value=self.config.get('training_interval', 1))
-        interval_spin = ttk.Spinbox(param_frame, from_=0, to=60, increment=0.5,
-                                    textvariable=self.interval_var, width=10)
-        interval_spin.grid(row=1, column=1, pady=2, padx=5)
-
-        ttk.Label(param_frame, text="Mean Time (s):").grid(row=2, column=0, sticky='w', pady=2)
+        ttk.Label(param_frame, text="Mean Time (s):").grid(row=0, column=0, sticky='w', pady=2)
         self.mean_time_var = tk.IntVar(value=self.config.get('mean_time', 0))
         mean_time_spin = ttk.Spinbox(param_frame, from_=0, to=300, increment=5,
                                      textvariable=self.mean_time_var, width=10)
-        mean_time_spin.grid(row=2, column=1, pady=2, padx=5)
+        mean_time_spin.grid(row=0, column=1, pady=2, padx=5)
 
         ttk.Label(param_frame, text="(0 = no resampling, >0 = average over window)",
-                 font=('TkDefaultFont', 8), foreground='gray').grid(row=3, column=0, columnspan=2, sticky='w', pady=2)
+                 font=('TkDefaultFont', 8), foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=2)
 
         # Training data management
         data_frame = ttk.LabelFrame(frame, text="Training Data Collection", padding=10)
@@ -358,9 +343,6 @@ class CPUTempMonitorApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill='x', padx=10, pady=10)
 
-        self.train_btn = ttk.Button(btn_frame, text="Collect + Train", command=self.start_training)
-        self.train_btn.pack(side='left', padx=5)
-
         self.train_from_data_btn = ttk.Button(
             btn_frame,
             text="Train From Data",
@@ -427,14 +409,6 @@ class CPUTempMonitorApp:
         self.anomaly_window_time_label.grid(row=4, column=2, sticky='w', pady=2)
         ttk.Label(model_frame, text="(Requires N consecutive points over threshold)",
                  font=('TkDefaultFont', 8), foreground='gray').grid(row=5, column=0, columnspan=3, sticky='w', pady=2)
-
-        # Monitor data collection option
-        ttk.Label(model_frame, text="").grid(row=6, column=0, pady=2)  # Spacer
-        self.collect_data_var = tk.BooleanVar(value=self.config.get('collect_data_on_monitor', False))
-        collect_check = ttk.Checkbutton(model_frame,
-                                        text="Also collect data during monitoring",
-                                        variable=self.collect_data_var)
-        collect_check.grid(row=7, column=0, columnspan=3, sticky='w', pady=2)
 
         # Dynamic window time label updates
         self.monitor_mean_time_var.trace_add('write', self.update_anomaly_window_time)
@@ -628,123 +602,6 @@ class CPUTempMonitorApp:
         if hasattr(self, 'train_from_data_btn'):
             self.train_from_data_btn.config(state=state)
 
-    def start_training(self):
-        """Start the training process in a background thread."""
-        if self.is_training:
-            return
-
-        self.is_training = True
-        self.train_btn.config(state='disabled')
-        self.train_from_data_btn.config(state='disabled')
-        self.stop_train_btn.config(state='normal')
-        self.save_btn.config(state='disabled')
-        self.progress_var.set(0)
-
-        def progress_callback(current, total):
-            progress = (current / total) * 100
-            self.root.after(0, lambda: self.progress_var.set(progress))
-            self.root.after(0, lambda: self.progress_label.config(
-                text=f"Collecting data: {current}/{total}"
-            ))
-
-        def train_thread():
-            try:
-                # Get mean_time parameter
-                mean_time = self.mean_time_var.get()
-                mean_time = mean_time if mean_time > 0 else None
-
-                # Create extractor and collect data
-                extractor = ComputerInfoExtractor(
-                    scaler_type=self.scaler_var.get(),
-                    use_time_features=True,
-                    lag_steps=[1, 2, 3],
-                    rolling_windows=[3, 5, 7]
-                )
-
-                # Extract and preprocess data
-                processed_data = extractor.extract_data_pipeline(
-                    csv=False,
-                    iterations=self.iterations_var.get(),
-                    interval=self.interval_var.get(),
-                    mean_time=mean_time,
-                    progress_callback=progress_callback,
-                    should_stop_callback=lambda: not self.is_training
-                )
-
-                if processed_data is not None and len(processed_data) > 0:
-                    self.training_data_df = extractor.data.copy()
-                    self.root.after(0, self.update_train_from_data_state)
-                    self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
-
-                if not self.is_training:  # Stopped
-                    return
-
-                # Get selected approach
-                approach = self.model_approach_var.get()
-
-                if approach == 'regressor':
-                    # Create regressor with extractor
-                    self.regressor = CoreTempRegressor(extractor=extractor)
-                    self.regressor.set_data(processed_data)
-                    self.regressor.configure_model(
-                        model=self.model_type_var.get(),
-                        multi_variable=self.multi_variable_var.get(),
-                        scaler=self.scaler_var.get(),
-                        use_time_features=True
-                    )
-
-                    # Train
-                    self.root.after(0, lambda: self.progress_label.config(text="Training regressor model..."))
-                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
-
-                    # Show metrics
-                    metrics = self.regressor.evaluate_metrics()
-                    metrics_text = (f"RMSE: {metrics['rmse']:.2f}\n"
-                                   f"MAE: {metrics['mae']:.2f}\n"
-                                   f"R2: {metrics['r2']:.3f}\n"
-                                   f"MAPE: {metrics['mape']:.1f}%")
-                else:
-                    # Create PCA model with extractor
-                    self.regressor = CoreTempPCA(extractor=extractor)
-                    self.regressor.set_data(processed_data)
-                    self.regressor.configure_model(
-                        model=self.pca_type_var.get(),
-                        multi_variable=self.multi_variable_var.get(),
-                        scaler=self.scaler_var.get(),
-                        use_time_features=True,
-                        n_components=self.pca_components_var.get()
-                    )
-
-                    # Train
-                    self.root.after(0, lambda: self.progress_label.config(text="Training PCA model..."))
-                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
-
-                    # Show metrics
-                    metrics = self.regressor.evaluate_metrics()
-                    metrics_text = (f"Mean Recon Error: {metrics['mean_reconstruction_error']:.4f}\n"
-                                   f"Std Recon Error: {metrics['std_reconstruction_error']:.4f}\n"
-                                   f"Anomalies: {metrics['n_anomalies']}\n"
-                                   f"Anomaly Rate: {metrics['anomaly_rate_percent']:.1f}%")
-
-                self.root.after(0, lambda: self.metrics_label.config(text=metrics_text))
-                self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
-                self.root.after(0, lambda: self.save_btn.config(state='normal'))
-                self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
-                self.root.after(0, self.update_train_from_data_state)
-
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Training failed: {e}"))
-                self.root.after(0, lambda: self.progress_label.config(text="Training failed"))
-
-            finally:
-                self.is_training = False
-                self.root.after(0, lambda: self.train_btn.config(state='normal'))
-                self.root.after(0, self.update_train_from_data_state)
-                self.root.after(0, lambda: self.stop_train_btn.config(state='disabled'))
-
-        self.training_thread = threading.Thread(target=train_thread, daemon=True)
-        self.training_thread.start()
-
     def train_from_existing_data(self):
         """Train a model using already collected or loaded data."""
         if self.is_training:
@@ -765,7 +622,6 @@ class CPUTempMonitorApp:
                 return
 
         self.is_training = True
-        self.train_btn.config(state='disabled')
         self.train_from_data_btn.config(state='disabled')
         self.stop_train_btn.config(state='normal')
         self.save_btn.config(state='disabled')
@@ -849,7 +705,6 @@ class CPUTempMonitorApp:
 
             finally:
                 self.is_training = False
-                self.root.after(0, lambda: self.train_btn.config(state='normal'))
                 self.root.after(0, self.update_train_from_data_state)
                 self.root.after(0, lambda: self.stop_train_btn.config(state='disabled'))
 
@@ -1085,7 +940,6 @@ class CPUTempMonitorApp:
                 notifications_enabled=self.notifications_var.get(),
                 on_open_gui=self.show_window,
                 on_quit_app=self.quit_application,
-                collect_data=self.collect_data_var.get(),
                 mean_time=self.monitor_mean_time_var.get(),
                 anomaly_window=self.monitor_anomaly_window_var.get()
             )
@@ -1509,10 +1363,7 @@ class CPUTempMonitorApp:
         self.config.set('pca_type', self.pca_type_var.get())
         self.config.set('pca_components', self.pca_components_var.get())
         self.config.set('multi_variable', self.multi_variable_var.get())
-        self.config.set('collect_data_on_monitor', self.collect_data_var.get())
         self.config.set('collection_interval', self.collection_interval_var.get())
-        self.config.set('training_iterations', self.iterations_var.get())
-        self.config.set('training_interval', self.interval_var.get())
         self.config.set('mean_time', self.mean_time_var.get())
         self.config.set('monitor_mean_time', self.monitor_mean_time_var.get())
         self.config.set('monitor_anomaly_window', self.monitor_anomaly_window_var.get())
