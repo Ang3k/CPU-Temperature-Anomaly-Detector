@@ -85,6 +85,10 @@ class TrayMonitor:
         self.prediction_counter = 0
         self.anomaly_window_buffer = deque(maxlen=self.anomaly_window)
 
+        # PSI detection data buffer (unbounded, accumulates during monitoring)
+        self.detection_data_buffer = []
+        self.latest_psi = None
+
     def _average_buffer(self, buffer: list) -> dict:
         """Average numeric values in a list of sensor dicts."""
         if not buffer:
@@ -102,6 +106,9 @@ class TrayMonitor:
 
     def _process_prediction(self, data: dict):
         """Run anomaly detection on provided data and update state."""
+        # Accumulate raw sensor data for PSI calculation
+        self.detection_data_buffer.append(data.copy())
+
         if self.is_pca_model:
             # PCA returns: (is_anomaly, reconstruction_error, threshold, actual)
             is_anomaly_raw, recon_error, threshold, actual = self.regressor.detect_anomaly(data)
@@ -141,6 +148,47 @@ class TrayMonitor:
                     f'Diff: {diff:+.1f}Â°C'
                 )
 
+    def calculate_psi(self):
+        """
+        Calculate PSI using model's training data vs accumulated detection data.
+
+        Returns:
+            dict: PSI values per feature, or None if insufficient data.
+        """
+        import pandas as pd
+
+        if not self.regressor or self.regressor.x_train is None:
+            return None
+
+        if len(self.detection_data_buffer) < 50:
+            return None
+
+        original_features = [
+            'cpu_load', 'cpu_power', 'cpu_clock', 'cpu_volt',
+            'gpu_temp', 'gpu_load', 'gpu_power',
+            'mb_temp', 'ram_load'
+        ]
+
+        # Build test DataFrame from accumulated detection data
+        detection_df = pd.DataFrame(self.detection_data_buffer)
+
+        # Keep only original features that exist in both train and detection data
+        available_features = [col for col in original_features
+                              if col in detection_df.columns
+                              and col in self.regressor.x_train.columns]
+
+        if not available_features:
+            return None
+
+        test_data = detection_df[available_features]
+        train_data = self.regressor.x_train[available_features]
+
+        self.latest_psi = self.regressor.calculate_PSI(
+            train_data=train_data,
+            test_data=test_data
+        )
+        return self.latest_psi
+
     def load_model(self, path: str = None):
         """Load the trained model."""
         if path:
@@ -167,6 +215,10 @@ class TrayMonitor:
                 loaded_model.extractor = extractor
 
             self.regressor = loaded_model
+
+            # Reset PSI state
+            self.detection_data_buffer = []
+            self.latest_psi = None
 
             # Detect if this is a PCA model
             self.is_pca_model = isinstance(loaded_model, CoreTempPCA)

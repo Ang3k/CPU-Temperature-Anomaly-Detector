@@ -15,6 +15,77 @@ import plotly.express as px
 import joblib
 
 
+def _calculate_feature_psi(train_series, test_series, n_bins=11, eps=1e-4):
+    """
+    Calculate PSI for one feature using train-derived bins.
+
+    Bins include -inf/+inf boundaries so values outside the train range are
+    counted instead of silently discarded by histogram boundaries.
+    """
+    train_values = pd.to_numeric(train_series, errors='coerce').to_numpy(dtype=float)
+    test_values = pd.to_numeric(test_series, errors='coerce').to_numpy(dtype=float)
+
+    train_values = train_values[np.isfinite(train_values)]
+    test_values = test_values[np.isfinite(test_values)]
+
+    if train_values.size == 0 or test_values.size == 0:
+        return None
+
+    # Keep previous behavior compatible: n_bins=11 yields ~10 intervals.
+    edge_points = max(3, int(n_bins))
+    train_min = float(np.min(train_values))
+    train_max = float(np.max(train_values))
+
+    if np.isclose(train_min, train_max):
+        # Constant train distribution: create a narrow middle bucket around value.
+        spread = max(abs(train_min) * 1e-6, 1e-6)
+        bins = np.array(
+            [-np.inf, train_min - spread, train_min + spread, np.inf],
+            dtype=float
+        )
+    else:
+        inner_edges = np.linspace(train_min, train_max, num=edge_points, dtype=float)
+        bins = np.concatenate(([-np.inf], inner_edges[1:-1], [np.inf]))
+        bins = np.unique(bins)
+        if bins.size < 3:
+            midpoint = (train_min + train_max) / 2.0
+            bins = np.array([-np.inf, midpoint, np.inf], dtype=float)
+
+    hist_train, _ = np.histogram(train_values, bins=bins)
+    hist_test, _ = np.histogram(test_values, bins=bins)
+
+    train_total = hist_train.sum()
+    test_total = hist_test.sum()
+    if train_total == 0 or test_total == 0:
+        return None
+
+    pct_train = hist_train.astype(float) / train_total
+    pct_test = hist_test.astype(float) / test_total
+
+    # Avoid log(0) and renormalize after smoothing.
+    pct_train = np.clip(pct_train, eps, None)
+    pct_test = np.clip(pct_test, eps, None)
+    pct_train = pct_train / pct_train.sum()
+    pct_test = pct_test / pct_test.sum()
+
+    psi_per_bin = (pct_test - pct_train) * np.log(pct_test / pct_train)
+    psi_value = float(np.sum(psi_per_bin))
+    return psi_value if np.isfinite(psi_value) else None
+
+
+def _calculate_psi_dict(train_data, test_data, feature_list, n_bins=11):
+    """Calculate PSI for available features shared by train and test data."""
+    columns = [col for col in feature_list if col in train_data.columns and col in test_data.columns]
+    psi_cols_dict = {}
+
+    for column in columns:
+        psi_value = _calculate_feature_psi(train_data[column], test_data[column], n_bins=n_bins)
+        if psi_value is not None:
+            psi_cols_dict[column] = psi_value
+
+    return psi_cols_dict
+
+
 class CoreTempRegressor:
     """
     CPU Temperature anomaly detection using regression models.
@@ -172,7 +243,7 @@ class CoreTempRegressor:
         x_test_scaled = self.scaler.transform(self.x_test)
 
         # Train model
-        self.model.fit(x_train_scaled, y_train)
+        self.model.fit(x_train_scaled, self.y_train)
 
         # Make predictions
         self.y_pred = self.model.predict(x_test_scaled)
@@ -213,7 +284,7 @@ class CoreTempRegressor:
         self.low_threshold = mean_diff - threshold_std * std_diff
         self.high_threshold = mean_diff + threshold_std * std_diff
 
-    def calculate_PSI(self, n_bins=11, plot=False):
+    def calculate_PSI(self, train_data=None, test_data=None, n_bins=11, plot=False):
         """
         Calculate Population Stability Index (PSI) for drift detection.
 
@@ -224,6 +295,8 @@ class CoreTempRegressor:
         - PSI >= 0.2: Significant change (model may need retraining)
 
         Args:
+            train_data: Optional training data for PSI calculation (default: None)
+            test_data: Optional test data for PSI calculation (default: None)
             n_bins: Number of bins for histogram (default: 11)
             plot: Whether to show bar plot of PSI values (default: False)
 
@@ -236,31 +309,18 @@ class CoreTempRegressor:
             'mb_temp', 'ram_load'
         ]
 
-        if self.x_train is None or self.x_test is None:
-            raise ValueError("Model not trained. Run fit_predict() first.")
+        if train_data is None or test_data is None:
+            if self.x_train is None or self.x_test is None:
+                raise ValueError("Model not trained. Run fit_predict() first.")
+            train_data = self.x_train
+            test_data = self.x_test
 
-        columns = [col for col in original_features if col in self.x_train.columns]
-        psi_cols_dict = {}
-
-        for column in columns:
-            list_train = self.x_train[column].to_list()
-            list_test = self.x_test[column].to_list()
-
-            bins = np.linspace(min(list_train), max(list_train), num=n_bins)
-
-            hist_train, _ = np.histogram(list_train, bins=bins)
-            hist_test, _ = np.histogram(list_test, bins=bins)
-
-            pct_train = hist_train / hist_train.sum()
-            pct_test = hist_test / hist_test.sum()
-
-            eps = 0.0001
-            pct_train = pct_train + eps
-            pct_test = pct_test + eps
-
-            psi_per_bin = (pct_test - pct_train) * np.log(pct_test / pct_train)
-            psi_value = np.sum(psi_per_bin)
-            psi_cols_dict[column] = psi_value
+        psi_cols_dict = _calculate_psi_dict(
+            train_data=train_data,
+            test_data=test_data,
+            feature_list=original_features,
+            n_bins=n_bins
+        )
 
         if plot:
             psi_df = pd.DataFrame(list(psi_cols_dict.items()), columns=['Feature', 'PSI'])
@@ -726,7 +786,7 @@ class CoreTempPCA:
         self.low_threshold = mean_error - threshold_std * std_error
         self.high_threshold = mean_error + threshold_std * std_error
 
-    def calculate_PSI(self, n_bins=11, plot=False):
+    def calculate_PSI(self, train_data = None, test_data = None, n_bins=11, plot=False):
         """
         Calculate Population Stability Index (PSI) for drift detection.
 
@@ -737,6 +797,8 @@ class CoreTempPCA:
         - PSI >= 0.2: Significant change (model may need retraining)
 
         Args:
+            train_data: Optional training data for PSI calculation (default: None)
+            test_data: Optional test data for PSI calculation (default: None)
             n_bins: Number of bins for histogram (default: 11)
             plot: Whether to show bar plot of PSI values (default: False)
 
@@ -749,31 +811,18 @@ class CoreTempPCA:
             'mb_temp', 'ram_load'
         ]
 
-        if self.x_train is None or self.x_test is None:
-            raise ValueError("Model not trained. Run fit_predict() first.")
+        if train_data is None or test_data is None:
+            if self.x_train is None or self.x_test is None:
+                raise ValueError("Model not trained. Run fit_predict() first.")
+            train_data = self.x_train
+            test_data = self.x_test
 
-        columns = self.x_train[original_features].columns.to_list()
-        psi_cols_dict = {}
-
-        for column in columns:
-            list_train = self.x_train[column].to_list()
-            list_test = self.x_test[column].to_list()
-
-            bins = np.linspace(min(list_train), max(list_train), num=n_bins)
-
-            hist_train, _ = np.histogram(list_train, bins=bins)
-            hist_test, _ = np.histogram(list_test, bins=bins)
-
-            pct_train = hist_train / hist_train.sum()
-            pct_test = hist_test / hist_test.sum()
-
-            eps = 0.0001
-            pct_train = pct_train + eps
-            pct_test = pct_test + eps
-
-            psi_per_bin = (pct_test - pct_train) * np.log(pct_test / pct_train)
-            psi_value = np.sum(psi_per_bin)
-            psi_cols_dict[column] = psi_value
+        psi_cols_dict = _calculate_psi_dict(
+            train_data=train_data,
+            test_data=test_data,
+            feature_list=original_features,
+            n_bins=n_bins
+        )
 
         if plot:
             psi_df = pd.DataFrame(list(psi_cols_dict.items()), columns=['Feature', 'PSI'])

@@ -28,6 +28,76 @@ from matplotlib.figure import Figure
 from collections import deque
 
 
+def get_startup_folder():
+    """Get the Windows Startup folder path."""
+    import os
+    return os.path.join(os.getenv('APPDATA'),
+                       'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+
+
+def get_startup_shortcut_path():
+    """Get the full path to the startup shortcut."""
+    return os.path.join(get_startup_folder(), 'CPU Temperature Monitor.lnk')
+
+
+def create_startup_shortcut():
+    """Create a shortcut in Windows Startup folder."""
+    try:
+        try:
+            import win32com.client
+        except ImportError:
+            print("Error: pywin32 not installed. Run: pip install pywin32")
+            return False
+
+        shortcut_path = get_startup_shortcut_path()
+
+        # Use pythonw.exe instead of python.exe to avoid showing a console window
+        python_dir = os.path.dirname(sys.executable)
+        target = os.path.join(python_dir, 'pythonw.exe')
+        if not os.path.exists(target):
+            # Fallback to python.exe if pythonw.exe not found
+            target = sys.executable
+
+        # Arguments: pythonw.exe app.py --startup
+        # Get the app.py absolute path
+        app_path = os.path.abspath(__file__)
+        arguments = f'"{app_path}" --startup'
+
+        # Working directory
+        working_dir = os.path.dirname(app_path)
+
+        # Create shortcut
+        shell = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(shortcut_path)
+        shortcut.TargetPath = target
+        shortcut.Arguments = arguments
+        shortcut.WorkingDirectory = working_dir
+        shortcut.Description = "CPU Temperature Monitor - Auto Start"
+        shortcut.save()
+
+        return True
+    except Exception as e:
+        print(f"Failed to create startup shortcut: {e}")
+        return False
+
+
+def remove_startup_shortcut():
+    """Remove the shortcut from Windows Startup folder."""
+    try:
+        shortcut_path = get_startup_shortcut_path()
+        if os.path.exists(shortcut_path):
+            os.remove(shortcut_path)
+        return True
+    except Exception as e:
+        print(f"Failed to remove startup shortcut: {e}")
+        return False
+
+
+def is_startup_enabled():
+    """Check if startup shortcut exists."""
+    return os.path.exists(get_startup_shortcut_path())
+
+
 class ConfigManager:
     """Manage application configuration."""
 
@@ -45,7 +115,9 @@ class ConfigManager:
         'collection_interval': 5.0,
         'mean_time': 0,
         'monitor_mean_time': 0,
-        'monitor_anomaly_window': 1
+        'monitor_anomaly_window': 1,
+        'start_with_windows': False,
+        'auto_start_collection': False
     }
 
     def __init__(self, config_path='config.yaml'):
@@ -81,7 +153,7 @@ class ConfigManager:
 class CPUTempMonitorApp:
     """Main application window."""
 
-    def __init__(self):
+    def __init__(self, start_minimized=False):
         self.root = tk.Tk()
         self.root.title("CPU Temperature Monitor")
         self.root.geometry("600x800")
@@ -89,6 +161,9 @@ class CPUTempMonitorApp:
 
         # Config
         self.config = ConfigManager()
+
+        # Startup mode flag
+        self.start_minimized = start_minimized
 
         # State
         self.regressor = None
@@ -463,6 +538,53 @@ class CPUTempMonitorApp:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
 
+        # PSI Controls
+        psi_ctrl_frame = ttk.LabelFrame(frame, text="Population Stability Index (PSI)", padding=5)
+        psi_ctrl_frame.pack(fill='x', padx=10, pady=5)
+
+        psi_btn_row = ttk.Frame(psi_ctrl_frame)
+        psi_btn_row.pack(fill='x', pady=(0, 5))
+
+        self.psi_btn = ttk.Button(psi_btn_row, text="Calculate PSI", command=self.calculate_psi, state='disabled')
+        self.psi_btn.pack(side='left', padx=5)
+
+        self.psi_auto_var = tk.BooleanVar(value=False)
+        self.psi_auto_check = ttk.Checkbutton(psi_btn_row, text="Auto-recalculate every",
+                                               variable=self.psi_auto_var, command=self.on_psi_auto_toggle)
+        self.psi_auto_check.pack(side='left', padx=(15, 2))
+
+        self.psi_interval_var = tk.IntVar(value=5)
+        self.psi_interval_spin = ttk.Spinbox(psi_btn_row, from_=1, to=1440, increment=1,
+                                              textvariable=self.psi_interval_var, width=5)
+        self.psi_interval_spin.pack(side='left', padx=2)
+        ttk.Label(psi_btn_row, text="min").pack(side='left')
+
+        self.psi_status_label = ttk.Label(psi_ctrl_frame, text="No PSI data yet", foreground='gray',
+                                           font=('TkDefaultFont', 8))
+        self.psi_status_label.pack(anchor='w', padx=5)
+
+        # PSI Bar Chart
+        psi_graph_frame = ttk.LabelFrame(frame, text="PSI per Feature", padding=5)
+        psi_graph_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+        self.psi_fig = Figure(figsize=(6, 2.5), dpi=80)
+        self.psi_fig.set_facecolor('#f0f0f0')
+        self.psi_ax = self.psi_fig.add_subplot(111)
+        self.psi_ax.set_ylabel('PSI')
+        self.psi_ax.set_title('Feature Drift (PSI)', fontsize=9)
+        self.psi_ax.axhline(y=0.1, color='orange', linestyle='--', linewidth=1.2, alpha=0.7, label='Moderate (0.1)')
+        self.psi_ax.axhline(y=0.2, color='red', linestyle='--', linewidth=1.2, alpha=0.7, label='Significant (0.2)')
+        self.psi_ax.legend(loc='upper right', fontsize=7)
+        self.psi_ax.grid(True, alpha=0.3)
+        self.psi_fig.tight_layout()
+
+        self.psi_canvas = FigureCanvasTkAgg(self.psi_fig, master=psi_graph_frame)
+        self.psi_canvas.draw()
+        self.psi_canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        # PSI auto-recalc timer state
+        self.psi_auto_timer_id = None
+
         # Status (compact)
         status_frame = ttk.LabelFrame(frame, text="Status", padding=5)
         status_frame.pack(fill='x', padx=10, pady=5)
@@ -549,6 +671,26 @@ class CPUTempMonitorApp:
                  text="Note: App ALWAYS minimizes to tray (never closes from X button).\nEverything continues running in background (training, collection, monitoring).",
                  font=('TkDefaultFont', 8),
                  foreground='gray').grid(row=2, column=0, columnspan=2, sticky='w', pady=5)
+
+        # Startup settings
+        startup_frame = ttk.LabelFrame(frame, text="Windows Startup", padding=10)
+        startup_frame.pack(fill='x', padx=10, pady=5)
+
+        self.start_with_windows_var = tk.BooleanVar(value=self.config.get('start_with_windows', False))
+        startup_check = ttk.Checkbutton(startup_frame, text="Start with Windows",
+                                        variable=self.start_with_windows_var,
+                                        command=self.on_start_with_windows_toggle)
+        startup_check.grid(row=0, column=0, sticky='w', pady=2)
+
+        self.auto_start_collection_var = tk.BooleanVar(value=self.config.get('auto_start_collection', False))
+        auto_collect_check = ttk.Checkbutton(startup_frame, text="Auto-start data collection on startup",
+                                             variable=self.auto_start_collection_var)
+        auto_collect_check.grid(row=1, column=0, sticky='w', pady=2)
+
+        ttk.Label(startup_frame,
+                 text="When enabled, app starts minimized to tray at Windows login.\nNo console window is shown. Data collection runs in background if auto-start is enabled.",
+                 font=('TkDefaultFont', 8),
+                 foreground='gray').grid(row=2, column=0, sticky='w', pady=5)
 
         # Save button
         save_frame = ttk.Frame(frame)
@@ -884,26 +1026,25 @@ class CPUTempMonitorApp:
             # Apply mean_time resampling if specified
             mean_time = self.mean_time_var.get()
             if mean_time > 0 and 'timestamp' in combined_df.columns:
-                original_rows = len(combined_df)
+                before_resample = len(combined_df)
                 combined_df = combined_df.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
                 # Recreate sequential time column after resampling
                 if 'time' in combined_df.columns:
                     combined_df['time'] = range(len(combined_df))
-                final_rows = len(combined_df)
-                resample_msg = f"\n\nResampled from {original_rows} to {final_rows} rows using {mean_time}s window"
+                after_resample = len(combined_df)
+                resample_msg = f"\nResampled: {before_resample} → {after_resample} rows ({mean_time}s window)"
             else:
-                final_rows = len(combined_df)
                 resample_msg = ""
 
+            final_rows = len(combined_df)
             self.training_data_df = combined_df
             self.update_train_from_data_state()
 
             # Build info message
             info_msg = (f"Combined {len(paths)} CSV files:\n" +
                        "\n".join(file_info) +
-                       f"\n\nTotal: {total_rows} rows combined" +
-                       (f" → {final_rows} rows after sorting" if final_rows != total_rows else "") +
-                       resample_msg)
+                       f"\n\nTotal: {total_rows} rows combined and sorted" +
+                       (f"\n{resample_msg}" if resample_msg else ""))
 
             # Ask if should train immediately
             should_train = messagebox.askyesno(
@@ -951,7 +1092,13 @@ class CPUTempMonitorApp:
             self.stop_monitor_btn.config(state='normal')
             self.minimize_btn.config(state='normal')
             self.apply_threshold_btn.config(state='normal')
+            self.psi_btn.config(state='normal')
             self.last_prediction_id = -1
+
+            # Reset PSI state
+            self.clear_psi_graph()
+            if self.psi_auto_var.get():
+                self.schedule_psi_auto()
 
             # Update status periodically
             self.update_status()
@@ -1053,6 +1200,102 @@ class CPUTempMonitorApp:
         self.line_diff.set_data([], [])
         self.canvas.draw_idle()
 
+    def calculate_psi(self):
+        """Calculate PSI on demand and update the bar chart."""
+        if not self.tray_monitor:
+            return
+
+        psi_dict = self.tray_monitor.calculate_psi()
+        if psi_dict is None:
+            sample_count = len(self.tray_monitor.detection_data_buffer) if self.tray_monitor else 0
+            if sample_count < 50:
+                msg = f"Need at least 50 samples (currently {sample_count})"
+            else:
+                msg = "PSI unavailable for current model/features"
+            self.psi_status_label.config(text=msg, foreground='orange')
+            return
+
+        self.update_psi_graph(psi_dict)
+        sample_count = len(self.tray_monitor.detection_data_buffer)
+        timestamp = time.strftime('%H:%M:%S')
+        self.psi_status_label.config(
+            text=f"Last updated: {timestamp} | {sample_count} samples",
+            foreground='green'
+        )
+
+    def update_psi_graph(self, psi_dict):
+        """Redraw the PSI bar chart with new values."""
+        self.psi_ax.clear()
+        self.psi_ax.set_ylabel('PSI')
+        self.psi_ax.set_title('Feature Drift (PSI)', fontsize=9)
+        self.psi_ax.grid(True, alpha=0.3)
+
+        # Threshold lines
+        self.psi_ax.axhline(y=0.1, color='orange', linestyle='--', linewidth=1.2, alpha=0.7, label='Moderate (0.1)')
+        self.psi_ax.axhline(y=0.2, color='red', linestyle='--', linewidth=1.2, alpha=0.7, label='Significant (0.2)')
+
+        if psi_dict:
+            features = list(psi_dict.keys())
+            values = list(psi_dict.values())
+
+            # Color bars by severity
+            colors = []
+            for v in values:
+                if v >= 0.2:
+                    colors.append('#ef4444')  # red
+                elif v >= 0.1:
+                    colors.append('#f59e0b')  # orange
+                else:
+                    colors.append('#22c55e')  # green
+
+            x_positions = range(len(features))
+            self.psi_ax.bar(x_positions, values, color=colors, alpha=0.8, edgecolor='gray', linewidth=0.5)
+            self.psi_ax.set_xticks(x_positions)
+            self.psi_ax.set_xticklabels(features, rotation=45, ha='right', fontsize=7)
+
+        self.psi_ax.legend(loc='upper right', fontsize=7)
+        self.psi_fig.tight_layout()
+        self.psi_canvas.draw_idle()
+
+    def clear_psi_graph(self):
+        """Clear the PSI bar chart."""
+        self.psi_ax.clear()
+        self.psi_ax.set_ylabel('PSI')
+        self.psi_ax.set_title('Feature Drift (PSI)', fontsize=9)
+        self.psi_ax.grid(True, alpha=0.3)
+        self.psi_ax.axhline(y=0.1, color='orange', linestyle='--', linewidth=1.2, alpha=0.7, label='Moderate (0.1)')
+        self.psi_ax.axhline(y=0.2, color='red', linestyle='--', linewidth=1.2, alpha=0.7, label='Significant (0.2)')
+        self.psi_ax.legend(loc='upper right', fontsize=7)
+        self.psi_fig.tight_layout()
+        self.psi_canvas.draw_idle()
+        self.psi_status_label.config(text="No PSI data yet", foreground='gray')
+
+    def on_psi_auto_toggle(self):
+        """Handle auto-recalculate PSI checkbox toggle."""
+        if self.psi_auto_var.get() and self.is_monitoring:
+            self.schedule_psi_auto()
+        else:
+            self.cancel_psi_auto()
+
+    def schedule_psi_auto(self):
+        """Schedule the next automatic PSI recalculation."""
+        self.cancel_psi_auto()
+        interval_ms = self.psi_interval_var.get() * 60 * 1000
+        self.psi_auto_timer_id = self.root.after(interval_ms, self.auto_psi_tick)
+
+    def cancel_psi_auto(self):
+        """Cancel any scheduled PSI auto-recalculation."""
+        if self.psi_auto_timer_id is not None:
+            self.root.after_cancel(self.psi_auto_timer_id)
+            self.psi_auto_timer_id = None
+
+    def auto_psi_tick(self):
+        """Auto-recalculation timer callback."""
+        if not self.is_monitoring or not self.psi_auto_var.get():
+            return
+        self.calculate_psi()
+        self.schedule_psi_auto()
+
     def stop_monitoring(self):
         """Stop the monitoring process."""
         if self.tray_monitor:
@@ -1065,14 +1308,19 @@ class CPUTempMonitorApp:
         self.stop_monitor_btn.config(state='disabled')
         self.minimize_btn.config(state='disabled')
         self.apply_threshold_btn.config(state='disabled')
+        self.psi_btn.config(state='disabled')
+
+        # Cancel PSI auto timer
+        self.cancel_psi_auto()
 
         self.status_text.config(state='normal')
         self.status_text.delete(1.0, tk.END)
         self.status_text.insert(tk.END, "Monitoring stopped")
         self.status_text.config(state='disabled')
 
-        # Clear graph for next session
+        # Clear graphs for next session
         self.clear_graph()
+        self.clear_psi_graph()
 
         # If window is minimized, create simple tray icon
         if not self.root.winfo_viewable():
@@ -1353,6 +1601,11 @@ class CPUTempMonitorApp:
         self.root.quit()
         self.root.destroy()
 
+    def on_start_with_windows_toggle(self):
+        """When 'Start with Windows' is checked, also check auto-start collection."""
+        if self.start_with_windows_var.get():
+            self.auto_start_collection_var.set(True)
+
     def save_settings(self):
         """Save current settings to config file."""
         self.config.set('check_interval', self.check_interval_var.get())
@@ -1367,8 +1620,23 @@ class CPUTempMonitorApp:
         self.config.set('mean_time', self.mean_time_var.get())
         self.config.set('monitor_mean_time', self.monitor_mean_time_var.get())
         self.config.set('monitor_anomaly_window', self.monitor_anomaly_window_var.get())
+        self.config.set('start_with_windows', self.start_with_windows_var.get())
+        self.config.set('auto_start_collection', self.auto_start_collection_var.get())
+
+        # Handle startup shortcut
+        if self.start_with_windows_var.get():
+            if create_startup_shortcut():
+                startup_msg = "✓ Added to Windows Startup"
+            else:
+                startup_msg = "⚠ Failed to add to Windows Startup"
+        else:
+            if remove_startup_shortcut():
+                startup_msg = "✓ Removed from Windows Startup"
+            else:
+                startup_msg = "⚠ Failed to remove from Windows Startup"
+
         self.config.save()
-        messagebox.showinfo("Settings", "Settings saved successfully")
+        messagebox.showinfo("Settings", f"Settings saved successfully\n\n{startup_msg}")
 
     def on_close(self):
         """Handle window close event - ALWAYS minimize to tray, never close."""
@@ -1382,11 +1650,28 @@ class CPUTempMonitorApp:
 
     def run(self):
         """Run the application."""
+        # Handle startup mode
+        if self.start_minimized:
+            # Start minimized to tray
+            self.root.withdraw()
+            self.create_simple_tray()
+
+            # Auto-start data collection if enabled
+            if self.config.get('auto_start_collection', False):
+                self.start_background_collection()
+
         self.root.mainloop()
 
 
 def main():
-    app = CPUTempMonitorApp()
+    # Parse command line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='CPU Temperature Monitor')
+    parser.add_argument('--startup', action='store_true',
+                       help='Start minimized to tray (used by Windows Startup)')
+    args = parser.parse_args()
+
+    app = CPUTempMonitorApp(start_minimized=args.startup)
     app.run()
 
 
