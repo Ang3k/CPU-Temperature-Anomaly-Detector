@@ -6,14 +6,12 @@ Provides background monitoring with Windows notifications.
 import threading
 import time
 from collections import deque
-from io import BytesIO
 
 from PIL import Image, ImageDraw
 from plyer import notification
 import pystray
 
 from .cpu_temp_bundled import HardwareMonitor
-from .core_regressor import CoreTempRegressor, CoreTempPCA
 from .conv_autoencoder import ConvAutoencoder
 from .data_extractor import ComputerInfoExtractor
 
@@ -67,6 +65,7 @@ class TrayMonitor:
         self.paused = False
         self.monitor_thread = None
         self.icon = None
+        self.last_error = None
 
         # Status info
         self.current_temp = 0.0
@@ -79,7 +78,6 @@ class TrayMonitor:
         self.high_threshold = 0.0
 
         # Model type detection
-        self.is_pca_model = False
         self.is_autoencoder_model = False
 
         # Per-feature reconstruction errors (autoencoder only)
@@ -89,10 +87,6 @@ class TrayMonitor:
         self.mean_buffer = []
         self.prediction_counter = 0
         self.anomaly_window_buffer = deque(maxlen=self.anomaly_window)
-
-        # PSI detection data buffer (unbounded, accumulates during monitoring)
-        self.detection_data_buffer = []
-        self.latest_psi = None
 
     def _average_buffer(self, buffer: list) -> dict:
         """Average numeric values in a list of sensor dicts."""
@@ -111,9 +105,6 @@ class TrayMonitor:
 
     def _process_prediction(self, data: dict):
         """Run anomaly detection on provided data and update state."""
-        # Accumulate raw sensor data for PSI calculation
-        self.detection_data_buffer.append(data.copy())
-
         if self.is_autoencoder_model:
             # Autoencoder returns: (is_anomaly, reconstruction_error, threshold, actual, per_feature_errors)
             is_anomaly_raw, recon_error, threshold, actual, per_feat = self.regressor.detect_anomaly(data)
@@ -121,12 +112,6 @@ class TrayMonitor:
             self.last_diff = recon_error
             self.predicted_temp = 0.0
             self.per_feature_errors = per_feat or {}
-        elif self.is_pca_model:
-            # PCA returns: (is_anomaly, reconstruction_error, threshold, actual)
-            is_anomaly_raw, recon_error, threshold, actual = self.regressor.detect_anomaly(data)
-            self.reconstruction_error = recon_error
-            self.last_diff = recon_error  # Use recon error as "diff" for display
-            self.predicted_temp = 0.0  # PCA doesn't predict temperature
         else:
             # Regressor returns: (is_anomaly, diff, predicted, actual)
             is_anomaly_raw, diff, predicted, actual = self.regressor.detect_anomaly(data)
@@ -146,7 +131,7 @@ class TrayMonitor:
         if is_anomaly_confirmed:
             self.anomaly_count += 1
             self.last_anomaly_time = time.strftime('%H:%M:%S')
-            if self.is_autoencoder_model or self.is_pca_model:
+            if self.is_autoencoder_model:
                 self.send_notification(
                     'CPU Temperature Anomaly!',
                     f'Temp: {actual:.1f}Â°C\n'
@@ -160,56 +145,13 @@ class TrayMonitor:
                     f'Diff: {diff:+.1f}Â°C'
                 )
 
-    def calculate_psi(self):
-        """
-        Calculate PSI using model's training data vs accumulated detection data.
-
-        Returns:
-            dict: PSI values per feature, or None if insufficient data.
-        """
-        import pandas as pd
-
-        if not self.regressor or self.regressor.x_train is None:
-            return None
-
-        if len(self.detection_data_buffer) < 50:
-            return None
-
-        if self.is_autoencoder_model:
-            original_features = list(self.regressor.feature_columns)
-        else:
-            original_features = [
-                'cpu_load', 'cpu_power', 'cpu_clock', 'cpu_volt',
-                'gpu_temp', 'gpu_load', 'gpu_power',
-                'mb_temp', 'ram_load'
-            ]
-
-        # Build test DataFrame from accumulated detection data
-        detection_df = pd.DataFrame(self.detection_data_buffer)
-
-        # Keep only original features that exist in both train and detection data
-        available_features = [col for col in original_features
-                              if col in detection_df.columns
-                              and col in self.regressor.x_train.columns]
-
-        if not available_features:
-            return None
-
-        test_data = detection_df[available_features]
-        train_data = self.regressor.x_train[available_features]
-
-        self.latest_psi = self.regressor.calculate_PSI(
-            train_data=train_data,
-            test_data=test_data
-        )
-        return self.latest_psi
-
     def load_model(self, path: str = None):
         """Load the trained model."""
         if path:
             self.model_path = path
         if self.model_path:
             loaded_model = None
+            self.last_error = None
 
             # Try loading as autoencoder (.pt/.pth) first, then joblib
             if self.model_path.endswith(('.pt', '.pth')):
@@ -217,6 +159,7 @@ class TrayMonitor:
                     loaded_model = ConvAutoencoder.load_model(self.model_path)
                 except Exception as e:
                     print(f"Error loading autoencoder model: {e}")
+                    self.last_error = f"Failed to load autoencoder model: {e}"
                     return False
             else:
                 try:
@@ -224,9 +167,12 @@ class TrayMonitor:
                     loaded_model = joblib.load(self.model_path)
                 except Exception as e:
                     print(f"Error loading model: {e}")
+                    self.last_error = (
+                        "Failed to load model. Train a current regressor or autoencoder model and try again."
+                    )
                     return False
 
-            # Backward compatibility: Add extractor if not present (regressor/PCA only)
+            # Backward compatibility: Add extractor if not present on regressor models
             if not isinstance(loaded_model, ConvAutoencoder):
                 if not hasattr(loaded_model, 'extractor') or loaded_model.extractor is None:
                     extractor = ComputerInfoExtractor(
@@ -239,13 +185,8 @@ class TrayMonitor:
 
             self.regressor = loaded_model
 
-            # Reset PSI state
-            self.detection_data_buffer = []
-            self.latest_psi = None
-
             # Detect model type
             self.is_autoencoder_model = isinstance(loaded_model, ConvAutoencoder)
-            self.is_pca_model = isinstance(loaded_model, CoreTempPCA)
 
             # Initialize buffer for real-time detection
             if hasattr(self.regressor, 'init_realtime_buffer'):
@@ -347,13 +288,10 @@ class TrayMonitor:
         status = "Paused" if self.paused else "Monitoring"
         if self.is_autoencoder_model:
             model_type = "Autoencoder"
-        elif self.is_pca_model:
-            model_type = "PCA"
         else:
             model_type = "Regressor"
 
-        if self.is_autoencoder_model or self.is_pca_model:
-            # PCA model status
+        if self.is_autoencoder_model:
             status_text = (f"Status: {status} ({model_type})\n"
                            f"CPU Temp: {self.current_temp:.1f}°C\n"
                            f"Recon Error: {self.reconstruction_error:.4f}\n"
@@ -395,11 +333,9 @@ class TrayMonitor:
         pause_text = "Resume" if self.paused else "Pause"
 
         # Build status menu based on model type
-        if self.is_autoencoder_model or self.is_pca_model:
-            # PCA / Autoencoder model menu
-            model_label = "Autoencoder" if self.is_autoencoder_model else "PCA"
+        if self.is_autoencoder_model:
             status_items = [
-                pystray.MenuItem(lambda text: f"Model: {model_label}", None, enabled=False),
+                pystray.MenuItem(lambda text: "Model: Autoencoder", None, enabled=False),
                 pystray.MenuItem(lambda text: f"Temp: {self.current_temp:.1f}°C", None, enabled=False),
                 pystray.MenuItem(lambda text: f"Recon Error: {self.reconstruction_error:.4f}", None, enabled=False),
                 pystray.Menu.SEPARATOR,

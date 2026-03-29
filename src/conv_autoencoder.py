@@ -60,9 +60,6 @@ class ConvAutoencoder(nn.Module):
         self.erros_per_feature = None
         self.per_feature_thresholds = {}
 
-        # Training data reference for PSI
-        self.x_train = None
-
         # Real-time detection buffer
         self.realtime_buffer = None
 
@@ -99,13 +96,6 @@ class ConvAutoencoder(nn.Module):
 
         data = processed_data[self.feature_columns].values
         data = self.scaler.fit_transform(data)
-
-        # Store raw training data for PSI
-        split_idx = int(len(data) * (1 - self.test_size))
-        self.x_train = pd.DataFrame(
-            processed_data[self.feature_columns].iloc[:split_idx].values,
-            columns=self.feature_columns
-        )
 
         windows = self.make_windows(data)
         train_data, test_data = train_test_split(windows, test_size=self.test_size, shuffle=False)
@@ -398,7 +388,6 @@ class ConvAutoencoder(nn.Module):
             'erros': self.erros,
             'erros_per_feature': getattr(self, 'erros_per_feature', None),
             'per_feature_thresholds': getattr(self, 'per_feature_thresholds', {}),
-            'x_train': self.x_train,
             'epochs': self.epochs,
             'batch_size': self.batch_size,
             'learning_rate': self.learning_rate,
@@ -432,7 +421,6 @@ class ConvAutoencoder(nn.Module):
         model.erros = save_dict.get('erros')
         model.erros_per_feature = save_dict.get('erros_per_feature')
         model.per_feature_thresholds = save_dict.get('per_feature_thresholds', {})
-        model.x_train = save_dict.get('x_train')
 
         # Recompute per-feature thresholds if missing but training errors exist
         if not model.per_feature_thresholds and model.erros_per_feature is not None:
@@ -444,24 +432,3 @@ class ConvAutoencoder(nn.Module):
 
         model.eval()
         return model
-
-    def calculate_PSI(self, train_data=None, test_data=None, n_bins=11, plot=False):
-        """
-        Calculate Population Stability Index (PSI) for drift detection.
-        Compatible with TrayMonitor.calculate_psi() interface.
-        """
-        from src.core_regressor import _calculate_feature_psi
-
-        if train_data is None:
-            train_data = self.x_train
-        if train_data is None:
-            return None
-
-        results = {}
-        for col in train_data.columns:
-            if col in test_data.columns:
-                psi_val = _calculate_feature_psi(train_data[col], test_data[col], n_bins=n_bins)
-                if psi_val is not None:
-                    results[col] = psi_val
-
-        return results if results else None

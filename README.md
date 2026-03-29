@@ -9,7 +9,8 @@ cpu_temp_detector/
 ├── src/                    # Código fonte
 │   ├── __init__.py
 │   ├── cpu_temp_bundled.py     # Interface com LibreHardwareMonitor
-│   ├── core_regressor.py       # Modelos de regressão e PCA para detecção de anomalias
+│   ├── core_regressor.py       # Modelos de regressão para detecção de anomalias
+│   ├── conv_autoencoder.py     # Autoencoder convolucional para erro de reconstrução
 │   ├── data_extractor.py       # Extração e engenharia de features
 │   ├── tray_monitor.py         # Monitor de bandeja do sistema
 │   └── lib/                    # DLLs do LibreHardwareMonitor
@@ -21,8 +22,7 @@ cpu_temp_detector/
 │   ├── cpu_temp_model_linear.joblib
 │   ├── cpu_temp_model_xgb.joblib
 │   ├── cpu_temp_model_lightgbm.joblib
-│   ├── cpu_temp_model_pca.joblib
-│   └── cpu_temp_model_kernel_pca.joblib
+│   └── cpu_temp_model_autoencoder.pt
 ├── notebooks/              # Jupyter notebooks (experimentação)
 │   └── cpu_temp.ipynb
 ├── app.py                  # Aplicativo GUI principal
@@ -55,9 +55,9 @@ python app.py
 ### 2. Treine um Modelo
 
 Na aba **Train**:
-- Selecione a abordagem: **Regressor** (regressão) ou **PCA** (erro de reconstrução)
+- Selecione a abordagem: **Regressor** (regressão) ou **Autoencoder** (erro de reconstrução)
 - Para Regressor: escolha o modelo (Linear, XGBoost, LightGBM)
-- Para PCA: escolha entre PCA ou Kernel PCA e configure o número de componentes
+- Para Autoencoder: configure janela, épocas, learning rate e batch size
 - Selecione o scaler (Standard, MinMax, Robust)
 - Colete dados usando a **coleta em background** ou carregue de **arquivo(s) CSV**
 - Opcionalmente, defina **mean time** para reamostrar os dados por janelas de tempo
@@ -67,7 +67,7 @@ Na aba **Train**:
 ### 3. Inicie o Monitoramento
 
 Na aba **Monitor**:
-- Selecione o modelo treinado (`.joblib`) — detecta automaticamente se é Regressor ou PCA
+- Selecione o modelo treinado (`.joblib` ou `.pt`) — detecta automaticamente se é Regressor ou Autoencoder
 - Configure o threshold de anomalia (padrão: 1.5 std)
 - Configure a **janela de anomalia** (número de anomalias consecutivas antes de alertar)
 - Clique em "Start Monitoring"
@@ -87,13 +87,12 @@ Edite `config.yaml` ou use a aba **Settings** na GUI:
 
 ```yaml
 model_path: models/cpu_temp_model_lightgbm.joblib
-model_approach: regressor          # 'regressor' ou 'pca'
+model_approach: regressor          # 'regressor' ou 'autoencoder'
 threshold_std: 1.5
 check_interval: 5
 mean_time: 5                       # Janela de reamostragem em segundos (opcional)
 monitor_anomaly_window: 1          # Anomalias consecutivas para confirmar alerta
 multi_variable: true               # Usar todos os sensores ou apenas tempo
-pca_components: 25                 # Componentes para PCA
 notifications_enabled: true
 minimize_to_tray: true
 ```
@@ -103,8 +102,8 @@ minimize_to_tray: true
 1. **Coleta de Dados**: Coleta em background ou carregamento de CSVs (sensores via LibreHardwareMonitor)
 2. **Reamostragem** (opcional): Agrega dados por janelas de tempo (mean time)
 3. **Feature Engineering**: Cria features de lag, rolling statistics, e diferenças
-4. **Treinamento**: Treina modelo de regressão ou PCA para detectar comportamento normal
-5. **Detecção**: Identifica anomalias quando a diferença (ou erro de reconstrução) excede o threshold
+4. **Treinamento**: Treina modelo de regressão ou autoencoder para detectar comportamento normal
+5. **Detecção**: Identifica anomalias quando a diferença ou o erro de reconstrução excede o threshold
 6. **Janela de Anomalia**: Requer N anomalias consecutivas antes de alertar, evitando falsos positivos
 
 ## Abordagens de Detecção
@@ -116,11 +115,11 @@ Prevê a temperatura "normal" da CPU com base nos outros sensores. Anomalias sã
 - **XGBoost**: Ótimo para padrões complexos
 - **LightGBM**: Balanceado entre velocidade e precisão (recomendado)
 
-### PCA (Análise de Componentes Principais)
-Usa erro de reconstrução para detectar anomalias. Dados que não se encaixam no padrão aprendido geram alto erro de reconstrução.
+### Autoencoder
+Usa erro de reconstrução em janelas temporais para detectar anomalias. Dados que não se encaixam no padrão aprendido geram alto erro de reconstrução.
 
-- **PCA**: Redução de dimensionalidade linear
-- **Kernel PCA**: Redução não-linear (kernel RBF), captura relações mais complexas
+- Aprende padrões multivariados ao longo do tempo
+- Permite acompanhar erro global e erro por sensor
 
 ## Desenvolvimento
 

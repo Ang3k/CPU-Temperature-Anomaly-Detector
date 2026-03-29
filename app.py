@@ -13,11 +13,10 @@ from pathlib import Path
 
 import yaml
 
-from src.core_regressor import CoreTempRegressor, CoreTempPCA
+from src.core_regressor import CoreTempRegressor
 from src.conv_autoencoder import ConvAutoencoder
 from src.data_extractor import ComputerInfoExtractor
 from src.tray_monitor import TrayMonitor
-from src.cpu_temp_bundled import HardwareMonitor
 
 import pystray
 from PIL import Image, ImageDraw
@@ -109,8 +108,6 @@ class ConfigManager:
         'notifications_enabled': True,
         'model_approach': 'regressor',
         'last_model_type': 'lightgbm',
-        'pca_type': 'pca',
-        'pca_components': 5,
         'last_scaler': 'standard',
         'multi_variable': True,
         'collection_interval': 5.0,
@@ -133,7 +130,11 @@ class ConfigManager:
                     loaded = yaml.safe_load(f) or {}
                     # Merge with defaults
                     config = self.DEFAULT_CONFIG.copy()
-                    config.update(loaded)
+                    for key in self.DEFAULT_CONFIG:
+                        if key in loaded:
+                            config[key] = loaded[key]
+                    if config.get('model_approach') not in {'regressor', 'autoencoder'}:
+                        config['model_approach'] = 'regressor'
                     return config
             except Exception:
                 pass
@@ -141,8 +142,9 @@ class ConfigManager:
 
     def save(self):
         """Save config to file."""
+        config_to_save = {key: self.config.get(key, default) for key, default in self.DEFAULT_CONFIG.items()}
         with open(self.config_path, 'w') as f:
-            yaml.dump(self.config, f, default_flow_style=False)
+            yaml.dump(config_to_save, f, default_flow_style=False)
 
     def get(self, key, default=None):
         return self.config.get(key, default)
@@ -270,18 +272,15 @@ class CPUTempMonitorApp:
         model_frame = ttk.LabelFrame(frame, text="Model Configuration", padding=10)
         model_frame.pack(fill='x', padx=10, pady=5)
 
-        # Model Approach Selection (Regressor vs PCA)
+        # Model approach selection
         ttk.Label(model_frame, text="Approach:").grid(row=0, column=0, sticky='w', pady=2)
         self.model_approach_var = tk.StringVar(value=self.config.get('model_approach', 'regressor'))
         approach_frame = ttk.Frame(model_frame)
-        approach_frame.grid(row=0, column=1, columnspan=3, sticky='w', pady=2)
+        approach_frame.grid(row=0, column=1, columnspan=2, sticky='w', pady=2)
 
         regressor_radio = ttk.Radiobutton(approach_frame, text="Regressor", variable=self.model_approach_var,
                                           value='regressor', command=self.on_approach_change)
         regressor_radio.pack(side='left', padx=(0, 15))
-        pca_radio = ttk.Radiobutton(approach_frame, text="PCA", variable=self.model_approach_var,
-                                    value='pca', command=self.on_approach_change)
-        pca_radio.pack(side='left', padx=(0, 15))
         autoencoder_radio = ttk.Radiobutton(approach_frame, text="Autoencoder", variable=self.model_approach_var,
                                             value='autoencoder', command=self.on_approach_change)
         autoencoder_radio.pack(side='left')
@@ -293,23 +292,9 @@ class CPUTempMonitorApp:
                                             values=['linear', 'xgb', 'lightgbm'], state='readonly', width=12)
         self.regressor_combo.grid(row=1, column=1, pady=2, padx=5, sticky='w')
 
-        # PCA model type
-        ttk.Label(model_frame, text="PCA Type:").grid(row=1, column=2, sticky='w', pady=2, padx=(10, 0))
-        self.pca_type_var = tk.StringVar(value=self.config.get('pca_type', 'pca'))
-        self.pca_combo = ttk.Combobox(model_frame, textvariable=self.pca_type_var,
-                                      values=['pca', 'kernel_pca'], state='readonly', width=12)
-        self.pca_combo.grid(row=1, column=3, pady=2, padx=5, sticky='w')
-
-        # PCA components
-        ttk.Label(model_frame, text="PCA Components:").grid(row=2, column=2, sticky='w', pady=2, padx=(10, 0))
-        self.pca_components_var = tk.IntVar(value=self.config.get('pca_components', 5))
-        self.pca_components_spin = ttk.Spinbox(model_frame, from_=2, to=50, increment=1,
-                                               textvariable=self.pca_components_var, width=10)
-        self.pca_components_spin.grid(row=2, column=3, pady=2, padx=5, sticky='w')
-
         # Autoencoder parameters
         self.ae_frame = ttk.LabelFrame(model_frame, text="Autoencoder Parameters", padding=5)
-        self.ae_frame.grid(row=4, column=0, columnspan=4, sticky='ew', pady=5)
+        self.ae_frame.grid(row=4, column=0, columnspan=2, sticky='ew', pady=5)
 
         ttk.Label(self.ae_frame, text="Window Size:").grid(row=0, column=0, sticky='w', pady=2)
         self.ae_window_var = tk.IntVar(value=self.config.get('ae_window_size', 60))
@@ -341,7 +326,7 @@ class CPUTempMonitorApp:
         self.multi_variable_var = tk.BooleanVar(value=self.config.get('multi_variable', True))
         multi_var_check = ttk.Checkbutton(model_frame, text="Use all sensors (multi-variable mode)",
                                           variable=self.multi_variable_var)
-        multi_var_check.grid(row=3, column=0, columnspan=4, sticky='w', pady=5)
+        multi_var_check.grid(row=3, column=0, columnspan=2, sticky='w', pady=5)
 
         # Initialize UI state based on current approach
         self.on_approach_change()
@@ -578,53 +563,6 @@ class CPUTempMonitorApp:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
 
-        # PSI Controls
-        psi_ctrl_frame = ttk.LabelFrame(frame, text="Population Stability Index (PSI)", padding=5)
-        psi_ctrl_frame.pack(fill='x', padx=10, pady=5)
-
-        psi_btn_row = ttk.Frame(psi_ctrl_frame)
-        psi_btn_row.pack(fill='x', pady=(0, 5))
-
-        self.psi_btn = ttk.Button(psi_btn_row, text="Calculate PSI", command=self.calculate_psi, state='disabled')
-        self.psi_btn.pack(side='left', padx=5)
-
-        self.psi_auto_var = tk.BooleanVar(value=False)
-        self.psi_auto_check = ttk.Checkbutton(psi_btn_row, text="Auto-recalculate every",
-                                               variable=self.psi_auto_var, command=self.on_psi_auto_toggle)
-        self.psi_auto_check.pack(side='left', padx=(15, 2))
-
-        self.psi_interval_var = tk.IntVar(value=5)
-        self.psi_interval_spin = ttk.Spinbox(psi_btn_row, from_=1, to=1440, increment=1,
-                                              textvariable=self.psi_interval_var, width=5)
-        self.psi_interval_spin.pack(side='left', padx=2)
-        ttk.Label(psi_btn_row, text="min").pack(side='left')
-
-        self.psi_status_label = ttk.Label(psi_ctrl_frame, text="No PSI data yet", foreground='gray',
-                                           font=('TkDefaultFont', 8))
-        self.psi_status_label.pack(anchor='w', padx=5)
-
-        # PSI Bar Chart
-        psi_graph_frame = ttk.LabelFrame(frame, text="PSI per Feature", padding=5)
-        psi_graph_frame.pack(fill='both', expand=True, padx=10, pady=5)
-
-        self.psi_fig = Figure(figsize=(6, 2.5), dpi=80)
-        self.psi_fig.set_facecolor('#f0f0f0')
-        self.psi_ax = self.psi_fig.add_subplot(111)
-        self.psi_ax.set_ylabel('PSI')
-        self.psi_ax.set_title('Feature Drift (PSI)', fontsize=9)
-        self.psi_ax.axhline(y=0.1, color='orange', linestyle='--', linewidth=1.2, alpha=0.7, label='Moderate (0.1)')
-        self.psi_ax.axhline(y=0.2, color='red', linestyle='--', linewidth=1.2, alpha=0.7, label='Significant (0.2)')
-        self.psi_ax.legend(loc='upper right', fontsize=7)
-        self.psi_ax.grid(True, alpha=0.3)
-        self.psi_fig.tight_layout()
-
-        self.psi_canvas = FigureCanvasTkAgg(self.psi_fig, master=psi_graph_frame)
-        self.psi_canvas.draw()
-        self.psi_canvas.get_tk_widget().pack(fill='both', expand=True)
-
-        # PSI auto-recalc timer state
-        self.psi_auto_timer_id = None
-
         # Status (compact)
         status_frame = ttk.LabelFrame(frame, text="Status", padding=5)
         status_frame.pack(fill='x', padx=10, pady=5)
@@ -752,24 +690,14 @@ class CPUTempMonitorApp:
         ttk.Label(info_frame, text=info_text, justify='left').pack()
 
     def on_approach_change(self):
-        """Handle approach change between Regressor, PCA, and Autoencoder."""
+        """Handle approach change between regressor and autoencoder."""
         approach = self.model_approach_var.get()
         if approach == 'regressor':
             self.regressor_combo.config(state='readonly')
-            self.pca_combo.config(state='disabled')
-            self.pca_components_spin.config(state='disabled')
-            self.ae_frame.grid()
-            self.ae_frame.grid_remove()
-        elif approach == 'pca':
-            self.regressor_combo.config(state='disabled')
-            self.pca_combo.config(state='readonly')
-            self.pca_components_spin.config(state='normal')
             self.ae_frame.grid()
             self.ae_frame.grid_remove()
         else:  # autoencoder
             self.regressor_combo.config(state='disabled')
-            self.pca_combo.config(state='disabled')
-            self.pca_components_spin.config(state='disabled')
             self.ae_frame.grid()
 
     def browse_model(self):
@@ -861,25 +789,6 @@ class CPUTempMonitorApp:
                                    f"MAE: {metrics['mae']:.2f}\n"
                                    f"R2: {metrics['r2']:.3f}\n"
                                    f"MAPE: {metrics['mape']:.1f}%")
-                elif approach == 'pca':
-                    # Create PCA model with extractor
-                    self.regressor = CoreTempPCA(extractor=extractor)
-                    self.regressor.set_data(processed_data)
-                    self.regressor.configure_model(
-                        model=self.pca_type_var.get(),
-                        multi_variable=self.multi_variable_var.get(),
-                        scaler=self.scaler_var.get(),
-                        use_time_features=True,
-                        n_components=self.pca_components_var.get()
-                    )
-
-                    self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
-
-                    metrics = self.regressor.evaluate_metrics()
-                    metrics_text = (f"Mean Recon Error: {metrics['mean_reconstruction_error']:.4f}\n"
-                                   f"Std Recon Error: {metrics['std_reconstruction_error']:.4f}\n"
-                                   f"Anomalies: {metrics['n_anomalies']}\n"
-                                   f"Anomaly Rate: {metrics['anomaly_rate_percent']:.1f}%")
                 else:  # autoencoder
                     self.regressor = ConvAutoencoder(
                         input_dim=7,
@@ -937,10 +846,7 @@ class CPUTempMonitorApp:
             filetypes = [("PyTorch files", "*.pt *.pth")]
             default_ext = ".pt"
         else:
-            if approach == 'regressor':
-                model_type = self.model_type_var.get()
-            else:
-                model_type = self.pca_type_var.get()
+            model_type = self.model_type_var.get()
             default_name = f"cpu_temp_model_{model_type}.joblib"
             filetypes = [("Joblib files", "*.joblib")]
             default_ext = ".joblib"
@@ -961,8 +867,6 @@ class CPUTempMonitorApp:
             # Update config
             self.config.set('model_approach', approach)
             self.config.set('last_model_type', self.model_type_var.get())
-            self.config.set('pca_type', self.pca_type_var.get())
-            self.config.set('pca_components', self.pca_components_var.get())
             self.config.set('last_scaler', self.scaler_var.get())
             self.config.set('multi_variable', self.multi_variable_var.get())
             self.config.set('mean_time', self.mean_time_var.get())
@@ -1160,24 +1064,20 @@ class CPUTempMonitorApp:
                 mean_time=self.monitor_mean_time_var.get(),
                 anomaly_window=self.monitor_anomaly_window_var.get()
             )
-            self.tray_monitor.load_model()
-            self.tray_monitor.start_monitoring()
+            if not self.tray_monitor.load_model():
+                raise RuntimeError(self.tray_monitor.last_error or "Failed to load model")
+            if not self.tray_monitor.start_monitoring():
+                raise RuntimeError(self.tray_monitor.last_error or "Failed to start monitoring")
 
             self.is_monitoring = True
             self.monitor_btn.config(state='disabled')
             self.stop_monitor_btn.config(state='normal')
             self.minimize_btn.config(state='normal')
             self.apply_threshold_btn.config(state='normal')
-            self.psi_btn.config(state='normal')
             self.last_prediction_id = -1
 
             # Adapt graph labels to model type
             self._configure_graph_for_model()
-
-            # Reset PSI state
-            self.clear_psi_graph()
-            if self.psi_auto_var.get():
-                self.schedule_psi_auto()
 
             # Update status periodically
             self.update_status()
@@ -1191,10 +1091,8 @@ class CPUTempMonitorApp:
     def _configure_graph_for_model(self):
         """Adapt graph titles, labels, and lines to the active model type."""
         is_ae = self.tray_monitor and self.tray_monitor.is_autoencoder_model
-        is_pca = self.tray_monitor and self.tray_monitor.is_pca_model
 
-        if is_ae or is_pca:
-            label = "Autoencoder" if is_ae else "PCA"
+        if is_ae:
             # Subplot 1: only actual temperature (no prediction)
             self.ax1.set_title('CPU Temperature', fontsize=9)
             self.ax1.set_ylabel('Temperature')
@@ -1204,7 +1102,7 @@ class CPUTempMonitorApp:
             self.ax1.legend(loc='upper left', fontsize=8)
 
             # Subplot 2: reconstruction error with threshold
-            self.ax2.set_title(f'Reconstruction Error ({label})', fontsize=9)
+            self.ax2.set_title('Reconstruction Error (Autoencoder)', fontsize=9)
             self.ax2.set_ylabel('Recon Error')
             self.line_diff.set_label('Recon Error')
             self.line_diff.set_color('dimgray')
@@ -1298,7 +1196,7 @@ class CPUTempMonitorApp:
             self.graph_times.append(self.graph_counter)
             self.graph_actual.append(self.tray_monitor.current_temp)
 
-            if self.tray_monitor.is_autoencoder_model or self.tray_monitor.is_pca_model:
+            if self.tray_monitor.is_autoencoder_model:
                 # No predicted temp — store actual again (hidden line) and recon error as diff
                 self.graph_predicted.append(self.tray_monitor.current_temp)
                 self.graph_diff.append(self.tray_monitor.reconstruction_error)
@@ -1328,7 +1226,7 @@ class CPUTempMonitorApp:
         actual = list(self.graph_actual)
         predicted = list(self.graph_predicted)
 
-        is_recon = self.tray_monitor and (self.tray_monitor.is_autoencoder_model or self.tray_monitor.is_pca_model)
+        is_recon = self.tray_monitor and self.tray_monitor.is_autoencoder_model
         is_ae = self.tray_monitor and self.tray_monitor.is_autoencoder_model
 
         # For autoencoder, use selected feature data; otherwise use global diff
@@ -1410,102 +1308,6 @@ class CPUTempMonitorApp:
         self.line_diff.set_data([], [])
         self.canvas.draw_idle()
 
-    def calculate_psi(self):
-        """Calculate PSI on demand and update the bar chart."""
-        if not self.tray_monitor:
-            return
-
-        psi_dict = self.tray_monitor.calculate_psi()
-        if psi_dict is None:
-            sample_count = len(self.tray_monitor.detection_data_buffer) if self.tray_monitor else 0
-            if sample_count < 50:
-                msg = f"Need at least 50 samples (currently {sample_count})"
-            else:
-                msg = "PSI unavailable for current model/features"
-            self.psi_status_label.config(text=msg, foreground='orange')
-            return
-
-        self.update_psi_graph(psi_dict)
-        sample_count = len(self.tray_monitor.detection_data_buffer)
-        timestamp = time.strftime('%H:%M:%S')
-        self.psi_status_label.config(
-            text=f"Last updated: {timestamp} | {sample_count} samples",
-            foreground='green'
-        )
-
-    def update_psi_graph(self, psi_dict):
-        """Redraw the PSI bar chart with new values."""
-        self.psi_ax.clear()
-        self.psi_ax.set_ylabel('PSI')
-        self.psi_ax.set_title('Feature Drift (PSI)', fontsize=9)
-        self.psi_ax.grid(True, alpha=0.3)
-
-        # Threshold lines
-        self.psi_ax.axhline(y=0.1, color='orange', linestyle='--', linewidth=1.2, alpha=0.7, label='Moderate (0.1)')
-        self.psi_ax.axhline(y=0.2, color='red', linestyle='--', linewidth=1.2, alpha=0.7, label='Significant (0.2)')
-
-        if psi_dict:
-            features = list(psi_dict.keys())
-            values = list(psi_dict.values())
-
-            # Color bars by severity
-            colors = []
-            for v in values:
-                if v >= 0.2:
-                    colors.append('#ef4444')  # red
-                elif v >= 0.1:
-                    colors.append('#f59e0b')  # orange
-                else:
-                    colors.append('#22c55e')  # green
-
-            x_positions = range(len(features))
-            self.psi_ax.bar(x_positions, values, color=colors, alpha=0.8, edgecolor='gray', linewidth=0.5)
-            self.psi_ax.set_xticks(x_positions)
-            self.psi_ax.set_xticklabels(features, rotation=45, ha='right', fontsize=7)
-
-        self.psi_ax.legend(loc='upper right', fontsize=7)
-        self.psi_fig.tight_layout()
-        self.psi_canvas.draw_idle()
-
-    def clear_psi_graph(self):
-        """Clear the PSI bar chart."""
-        self.psi_ax.clear()
-        self.psi_ax.set_ylabel('PSI')
-        self.psi_ax.set_title('Feature Drift (PSI)', fontsize=9)
-        self.psi_ax.grid(True, alpha=0.3)
-        self.psi_ax.axhline(y=0.1, color='orange', linestyle='--', linewidth=1.2, alpha=0.7, label='Moderate (0.1)')
-        self.psi_ax.axhline(y=0.2, color='red', linestyle='--', linewidth=1.2, alpha=0.7, label='Significant (0.2)')
-        self.psi_ax.legend(loc='upper right', fontsize=7)
-        self.psi_fig.tight_layout()
-        self.psi_canvas.draw_idle()
-        self.psi_status_label.config(text="No PSI data yet", foreground='gray')
-
-    def on_psi_auto_toggle(self):
-        """Handle auto-recalculate PSI checkbox toggle."""
-        if self.psi_auto_var.get() and self.is_monitoring:
-            self.schedule_psi_auto()
-        else:
-            self.cancel_psi_auto()
-
-    def schedule_psi_auto(self):
-        """Schedule the next automatic PSI recalculation."""
-        self.cancel_psi_auto()
-        interval_ms = self.psi_interval_var.get() * 60 * 1000
-        self.psi_auto_timer_id = self.root.after(interval_ms, self.auto_psi_tick)
-
-    def cancel_psi_auto(self):
-        """Cancel any scheduled PSI auto-recalculation."""
-        if self.psi_auto_timer_id is not None:
-            self.root.after_cancel(self.psi_auto_timer_id)
-            self.psi_auto_timer_id = None
-
-    def auto_psi_tick(self):
-        """Auto-recalculation timer callback."""
-        if not self.is_monitoring or not self.psi_auto_var.get():
-            return
-        self.calculate_psi()
-        self.schedule_psi_auto()
-
     def stop_monitoring(self):
         """Stop the monitoring process."""
         if self.tray_monitor:
@@ -1518,10 +1320,6 @@ class CPUTempMonitorApp:
         self.stop_monitor_btn.config(state='disabled')
         self.minimize_btn.config(state='disabled')
         self.apply_threshold_btn.config(state='disabled')
-        self.psi_btn.config(state='disabled')
-
-        # Cancel PSI auto timer
-        self.cancel_psi_auto()
 
         self.status_text.config(state='normal')
         self.status_text.delete(1.0, tk.END)
@@ -1530,7 +1328,6 @@ class CPUTempMonitorApp:
 
         # Clear graphs for next session
         self.clear_graph()
-        self.clear_psi_graph()
 
         # If window is minimized, create simple tray icon
         if not self.root.winfo_viewable():
@@ -1658,7 +1455,7 @@ class CPUTempMonitorApp:
             # Update status display
             self.update_status()
 
-            if self.tray_monitor.is_autoencoder_model or self.tray_monitor.is_pca_model:
+            if self.tray_monitor.is_autoencoder_model:
                 msg = (f"Threshold updated to {new_threshold:.1f} std\n"
                        f"New error threshold: {self.tray_monitor.high_threshold:.4f}")
             else:
@@ -1827,8 +1624,6 @@ class CPUTempMonitorApp:
         self.config.set('threshold_std', self.threshold_var.get())
         self.config.set('model_approach', self.model_approach_var.get())
         self.config.set('last_model_type', self.model_type_var.get())
-        self.config.set('pca_type', self.pca_type_var.get())
-        self.config.set('pca_components', self.pca_components_var.get())
         self.config.set('multi_variable', self.multi_variable_var.get())
         self.config.set('collection_interval', self.collection_interval_var.get())
         self.config.set('mean_time', self.mean_time_var.get())
