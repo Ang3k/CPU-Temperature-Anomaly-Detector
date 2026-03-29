@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 
 from src.core_regressor import CoreTempRegressor, CoreTempPCA
+from src.conv_autoencoder import ConvAutoencoder
 from src.data_extractor import ComputerInfoExtractor
 from src.tray_monitor import TrayMonitor
 from src.cpu_temp_bundled import HardwareMonitor
@@ -280,7 +281,10 @@ class CPUTempMonitorApp:
         regressor_radio.pack(side='left', padx=(0, 15))
         pca_radio = ttk.Radiobutton(approach_frame, text="PCA", variable=self.model_approach_var,
                                     value='pca', command=self.on_approach_change)
-        pca_radio.pack(side='left')
+        pca_radio.pack(side='left', padx=(0, 15))
+        autoencoder_radio = ttk.Radiobutton(approach_frame, text="Autoencoder", variable=self.model_approach_var,
+                                            value='autoencoder', command=self.on_approach_change)
+        autoencoder_radio.pack(side='left')
 
         # Regressor model type
         ttk.Label(model_frame, text="Regressor:").grid(row=1, column=0, sticky='w', pady=2)
@@ -302,6 +306,29 @@ class CPUTempMonitorApp:
         self.pca_components_spin = ttk.Spinbox(model_frame, from_=2, to=50, increment=1,
                                                textvariable=self.pca_components_var, width=10)
         self.pca_components_spin.grid(row=2, column=3, pady=2, padx=5, sticky='w')
+
+        # Autoencoder parameters
+        self.ae_frame = ttk.LabelFrame(model_frame, text="Autoencoder Parameters", padding=5)
+        self.ae_frame.grid(row=4, column=0, columnspan=4, sticky='ew', pady=5)
+
+        ttk.Label(self.ae_frame, text="Window Size:").grid(row=0, column=0, sticky='w', pady=2)
+        self.ae_window_var = tk.IntVar(value=self.config.get('ae_window_size', 60))
+        ttk.Spinbox(self.ae_frame, from_=10, to=200, increment=10,
+                     textvariable=self.ae_window_var, width=10).grid(row=0, column=1, pady=2, padx=5, sticky='w')
+
+        ttk.Label(self.ae_frame, text="Epochs:").grid(row=0, column=2, sticky='w', pady=2, padx=(10, 0))
+        self.ae_epochs_var = tk.IntVar(value=self.config.get('ae_epochs', 20))
+        ttk.Spinbox(self.ae_frame, from_=5, to=200, increment=5,
+                     textvariable=self.ae_epochs_var, width=10).grid(row=0, column=3, pady=2, padx=5, sticky='w')
+
+        ttk.Label(self.ae_frame, text="Learning Rate:").grid(row=1, column=0, sticky='w', pady=2)
+        self.ae_lr_var = tk.DoubleVar(value=self.config.get('ae_learning_rate', 1e-3))
+        ttk.Entry(self.ae_frame, textvariable=self.ae_lr_var, width=12).grid(row=1, column=1, pady=2, padx=5, sticky='w')
+
+        ttk.Label(self.ae_frame, text="Batch Size:").grid(row=1, column=2, sticky='w', pady=2, padx=(10, 0))
+        self.ae_batch_var = tk.IntVar(value=self.config.get('ae_batch_size', 32))
+        ttk.Spinbox(self.ae_frame, from_=8, to=256, increment=8,
+                     textvariable=self.ae_batch_var, width=10).grid(row=1, column=3, pady=2, padx=5, sticky='w')
 
         # Scaler
         ttk.Label(model_frame, text="Scaler:").grid(row=2, column=0, sticky='w', pady=2)
@@ -506,6 +533,19 @@ class CPUTempMonitorApp:
         # Real-time Graph
         graph_frame = ttk.LabelFrame(frame, text="Real-time Temperature Graph", padding=5)
         graph_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+        # Feature selector for autoencoder (hidden by default)
+        self.ae_feature_frame = ttk.Frame(graph_frame)
+        ttk.Label(self.ae_feature_frame, text="Show Error:").pack(side='left', padx=(0, 5))
+        self.ae_feature_var = tk.StringVar(value='All (Global)')
+        self.ae_feature_combo = ttk.Combobox(self.ae_feature_frame, textvariable=self.ae_feature_var,
+                                              state='readonly', width=20)
+        self.ae_feature_combo['values'] = ['All (Global)']
+        self.ae_feature_combo.pack(side='left')
+        self.ae_feature_combo.bind('<<ComboboxSelected>>', self._on_ae_feature_change)
+
+        # Per-feature error history buffers
+        self.graph_per_feature = {}
 
         # Create matplotlib figure with 2 subplots
         self.fig = Figure(figsize=(6, 4), dpi=80)
@@ -712,18 +752,25 @@ class CPUTempMonitorApp:
         ttk.Label(info_frame, text=info_text, justify='left').pack()
 
     def on_approach_change(self):
-        """Handle approach change between Regressor and PCA."""
+        """Handle approach change between Regressor, PCA, and Autoencoder."""
         approach = self.model_approach_var.get()
         if approach == 'regressor':
-            # Enable regressor combo, disable PCA options
             self.regressor_combo.config(state='readonly')
             self.pca_combo.config(state='disabled')
             self.pca_components_spin.config(state='disabled')
-        else:
-            # Disable regressor combo, enable PCA options
+            self.ae_frame.grid()
+            self.ae_frame.grid_remove()
+        elif approach == 'pca':
             self.regressor_combo.config(state='disabled')
             self.pca_combo.config(state='readonly')
             self.pca_components_spin.config(state='normal')
+            self.ae_frame.grid()
+            self.ae_frame.grid_remove()
+        else:  # autoencoder
+            self.regressor_combo.config(state='disabled')
+            self.pca_combo.config(state='disabled')
+            self.pca_components_spin.config(state='disabled')
+            self.ae_frame.grid()
 
     def browse_model(self):
         """Open file dialog to select a model."""
@@ -731,7 +778,7 @@ class CPUTempMonitorApp:
         path = filedialog.askopenfilename(
             initialdir=initial_dir,
             title="Select Model",
-            filetypes=[("Joblib files", "*.joblib"), ("All files", "*.*")]
+            filetypes=[("Model files", "*.joblib *.pt *.pth"), ("Joblib files", "*.joblib"), ("PyTorch files", "*.pt *.pth"), ("All files", "*.*")]
         )
         if path:
             self.model_path_var.set(path)
@@ -814,7 +861,7 @@ class CPUTempMonitorApp:
                                    f"MAE: {metrics['mae']:.2f}\n"
                                    f"R2: {metrics['r2']:.3f}\n"
                                    f"MAPE: {metrics['mape']:.1f}%")
-                else:
+                elif approach == 'pca':
                     # Create PCA model with extractor
                     self.regressor = CoreTempPCA(extractor=extractor)
                     self.regressor.set_data(processed_data)
@@ -827,6 +874,23 @@ class CPUTempMonitorApp:
                     )
 
                     self.regressor.fit_predict(train_size=0.8, threshold_std=self.threshold_var.get())
+
+                    metrics = self.regressor.evaluate_metrics()
+                    metrics_text = (f"Mean Recon Error: {metrics['mean_reconstruction_error']:.4f}\n"
+                                   f"Std Recon Error: {metrics['std_reconstruction_error']:.4f}\n"
+                                   f"Anomalies: {metrics['n_anomalies']}\n"
+                                   f"Anomaly Rate: {metrics['anomaly_rate_percent']:.1f}%")
+                else:  # autoencoder
+                    self.regressor = ConvAutoencoder(
+                        input_dim=7,
+                        window_size=self.ae_window_var.get(),
+                        epochs=self.ae_epochs_var.get(),
+                        batch_size=self.ae_batch_var.get(),
+                        learning_rate=self.ae_lr_var.get(),
+                        threshold_std=self.threshold_var.get(),
+                    )
+
+                    self.regressor.fit_reconstruct(processed_data)
 
                     metrics = self.regressor.evaluate_metrics()
                     metrics_text = (f"Mean Recon Error: {metrics['mean_reconstruction_error']:.4f}\n"
@@ -868,18 +932,25 @@ class CPUTempMonitorApp:
 
         # Generate filename based on approach
         approach = self.model_approach_var.get()
-        if approach == 'regressor':
-            model_type = self.model_type_var.get()
+        if approach == 'autoencoder':
+            default_name = "cpu_temp_model_autoencoder.pt"
+            filetypes = [("PyTorch files", "*.pt *.pth")]
+            default_ext = ".pt"
         else:
-            model_type = self.pca_type_var.get()
-        default_name = f"cpu_temp_model_{model_type}.joblib"
+            if approach == 'regressor':
+                model_type = self.model_type_var.get()
+            else:
+                model_type = self.pca_type_var.get()
+            default_name = f"cpu_temp_model_{model_type}.joblib"
+            filetypes = [("Joblib files", "*.joblib")]
+            default_ext = ".joblib"
 
         path = filedialog.asksaveasfilename(
             initialdir='models',
             initialfile=default_name,
             title="Save Model",
-            filetypes=[("Joblib files", "*.joblib")],
-            defaultextension=".joblib"
+            filetypes=filetypes,
+            defaultextension=default_ext
         )
 
         if path:
@@ -896,6 +967,11 @@ class CPUTempMonitorApp:
             self.config.set('multi_variable', self.multi_variable_var.get())
             self.config.set('mean_time', self.mean_time_var.get())
             self.config.set('model_path', path)
+            if approach == 'autoencoder':
+                self.config.set('ae_window_size', self.ae_window_var.get())
+                self.config.set('ae_epochs', self.ae_epochs_var.get())
+                self.config.set('ae_batch_size', self.ae_batch_var.get())
+                self.config.set('ae_learning_rate', self.ae_lr_var.get())
             self.config.save()
 
     def save_training_data(self):
@@ -1095,6 +1171,9 @@ class CPUTempMonitorApp:
             self.psi_btn.config(state='normal')
             self.last_prediction_id = -1
 
+            # Adapt graph labels to model type
+            self._configure_graph_for_model()
+
             # Reset PSI state
             self.clear_psi_graph()
             if self.psi_auto_var.get():
@@ -1108,6 +1187,94 @@ class CPUTempMonitorApp:
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to start monitoring: {e}")
+
+    def _configure_graph_for_model(self):
+        """Adapt graph titles, labels, and lines to the active model type."""
+        is_ae = self.tray_monitor and self.tray_monitor.is_autoencoder_model
+        is_pca = self.tray_monitor and self.tray_monitor.is_pca_model
+
+        if is_ae or is_pca:
+            label = "Autoencoder" if is_ae else "PCA"
+            # Subplot 1: only actual temperature (no prediction)
+            self.ax1.set_title('CPU Temperature', fontsize=9)
+            self.ax1.set_ylabel('Temperature')
+            self.line_actual.set_label('Actual')
+            self.line_predicted.set_label('')
+            self.line_predicted.set_linestyle('None')
+            self.ax1.legend(loc='upper left', fontsize=8)
+
+            # Subplot 2: reconstruction error with threshold
+            self.ax2.set_title(f'Reconstruction Error ({label})', fontsize=9)
+            self.ax2.set_ylabel('Recon Error')
+            self.line_diff.set_label('Recon Error')
+            self.line_diff.set_color('dimgray')
+            self.line_low_thresh.set_visible(False)
+            self.line_high_thresh.set_label('Threshold')
+            self.line_high_thresh.set_color('orange')
+            self.line_high_thresh.set_linewidth(2)
+            self.ax2.legend(loc='upper left', fontsize=8)
+        else:
+            # Regressor defaults
+            self.ax1.set_title('Actual vs Predicted', fontsize=9)
+            self.ax1.set_ylabel('Temperature (°C)')
+            self.line_actual.set_label('Actual')
+            self.line_predicted.set_label('Predicted')
+            self.line_predicted.set_linestyle('--')
+            self.ax1.legend(loc='upper left', fontsize=8)
+
+            self.ax2.set_title('Prediction Error (Diff)', fontsize=9)
+            self.ax2.set_ylabel('Diff (°C)')
+            self.line_diff.set_label('Diff')
+            self.line_diff.set_color('orange')
+            self.line_low_thresh.set_visible(True)
+            self.line_high_thresh.set_label('High')
+            self.line_high_thresh.set_color('red')
+            self.line_high_thresh.set_linewidth(1.5)
+            self.ax2.legend(loc='upper left', fontsize=8)
+
+        # Show/hide autoencoder feature selector
+        if is_ae:
+            features = getattr(self.tray_monitor.regressor, 'feature_columns', [])
+            self.ae_feature_combo['values'] = ['All (Global)'] + list(features)
+            self.ae_feature_var.set('All (Global)')
+            self.ae_feature_frame.pack(fill='x', pady=(0, 5))
+            # Init per-feature history buffers
+            self.graph_per_feature = {col: deque(maxlen=self.graph_max_points) for col in features}
+        else:
+            self.ae_feature_frame.pack_forget()
+            self.graph_per_feature = {}
+
+        self.canvas.draw_idle()
+
+    def _on_ae_feature_change(self, event=None):
+        """Handle autoencoder feature dropdown change — redraw graph immediately."""
+        self.update_graph()
+
+    def _get_ae_graph_data(self):
+        """Return (error_values, threshold) for the currently selected autoencoder feature."""
+        selected = self.ae_feature_var.get()
+        if selected == 'All (Global)':
+            return list(self.graph_diff), self.tray_monitor.high_threshold if self.tray_monitor else 0.0
+
+        buf = self.graph_per_feature.get(selected)
+        if buf is None or len(buf) == 0:
+            return [], 0.0
+
+        errors = list(buf)
+
+        # Get per-feature threshold from model
+        threshold = 0.0
+        if self.tray_monitor and hasattr(self.tray_monitor.regressor, 'per_feature_thresholds'):
+            threshold = self.tray_monitor.regressor.per_feature_thresholds.get(selected, 0.0)
+
+        # Fallback: estimate threshold from accumulated real-time data
+        if threshold == 0.0 and len(errors) >= 10:
+            import numpy as np
+            arr = np.array(errors)
+            std_mult = self.threshold_var.get()
+            threshold = float(arr.mean() + std_mult * arr.std())
+
+        return errors, threshold
 
     def update_status(self):
         """Update the status display and graph."""
@@ -1130,8 +1297,20 @@ class CPUTempMonitorApp:
         if new_prediction and self.tray_monitor.current_temp > 0:
             self.graph_times.append(self.graph_counter)
             self.graph_actual.append(self.tray_monitor.current_temp)
-            self.graph_predicted.append(self.tray_monitor.predicted_temp)
-            self.graph_diff.append(self.tray_monitor.last_diff)
+
+            if self.tray_monitor.is_autoencoder_model or self.tray_monitor.is_pca_model:
+                # No predicted temp — store actual again (hidden line) and recon error as diff
+                self.graph_predicted.append(self.tray_monitor.current_temp)
+                self.graph_diff.append(self.tray_monitor.reconstruction_error)
+                # Store per-feature errors for autoencoder
+                if self.tray_monitor.is_autoencoder_model and self.tray_monitor.per_feature_errors:
+                    for col, err in self.tray_monitor.per_feature_errors.items():
+                        if col in self.graph_per_feature:
+                            self.graph_per_feature[col].append(err)
+            else:
+                self.graph_predicted.append(self.tray_monitor.predicted_temp)
+                self.graph_diff.append(self.tray_monitor.last_diff)
+
             self.graph_counter += 1
 
             # Update graph
@@ -1148,40 +1327,69 @@ class CPUTempMonitorApp:
         times = list(self.graph_times)
         actual = list(self.graph_actual)
         predicted = list(self.graph_predicted)
-        diff = list(self.graph_diff)
 
-        # Update subplot 1: Actual vs Predicted
+        is_recon = self.tray_monitor and (self.tray_monitor.is_autoencoder_model or self.tray_monitor.is_pca_model)
+        is_ae = self.tray_monitor and self.tray_monitor.is_autoencoder_model
+
+        # For autoencoder, use selected feature data; otherwise use global diff
+        if is_ae:
+            diff, high_thresh = self._get_ae_graph_data()
+            # Align lengths: diff may be shorter or empty
+            n = len(diff)
+            if n == 0:
+                diff_times = []
+                diff_actual = []
+            elif n < len(times):
+                diff_times = times[-n:]
+                diff_actual = actual[-n:]
+            else:
+                diff_times = times
+                diff_actual = actual
+        else:
+            diff = list(self.graph_diff)
+            diff_times = times
+            diff_actual = actual
+            high_thresh = float(self.tray_monitor.high_threshold or 0) if self.tray_monitor else 0.0
+
+        # Update subplot 1: Temperature (always use full times/actual)
         self.line_actual.set_data(times, actual)
-        self.line_predicted.set_data(times, predicted)
+        if not is_recon:
+            self.line_predicted.set_data(times, predicted)
 
         # Adjust axes for subplot 1
         if times:
             self.ax1.set_xlim(min(times), max(times) + 1)
-            all_temps = actual + predicted
+            all_temps = actual if is_recon else actual + predicted
             if all_temps:
                 min_temp = min(all_temps) - 2
                 max_temp = max(all_temps) + 2
                 self.ax1.set_ylim(min_temp, max_temp)
 
-        # Update subplot 2: Diff with Thresholds
-        self.line_diff.set_data(times, diff)
+        # Update subplot 2: Error / Diff with Thresholds
+        self.line_diff.set_data(diff_times, diff)
 
-        # Update threshold lines
-        if self.tray_monitor:
+        # Update threshold line
+        self.line_high_thresh.set_ydata([float(high_thresh), float(high_thresh)])
+        if not is_recon and self.tray_monitor:
             low_thresh = self.tray_monitor.low_threshold or 0.0
-            high_thresh = self.tray_monitor.high_threshold or 0.0
             self.line_low_thresh.set_ydata([float(low_thresh), float(low_thresh)])
-            self.line_high_thresh.set_ydata([float(high_thresh), float(high_thresh)])
+
+        # Update subplot 2 title with selected feature
+        if is_ae:
+            selected = self.ae_feature_var.get()
+            self.ax2.set_title(f'Reconstruction Error — {selected}', fontsize=9)
 
         # Adjust axes for subplot 2
-        if times:
-            self.ax2.set_xlim(min(times), max(times) + 1)
-            if diff:
+        if diff_times and diff:
+            self.ax2.set_xlim(min(diff_times), max(diff_times) + 1)
+            if is_recon:
+                min_diff = min(min(diff), 0) * 0.9
+                max_diff = max(max(diff), high_thresh) * 1.1
+            else:
                 low_thresh = float(self.tray_monitor.low_threshold or 0) if self.tray_monitor else 0.0
-                high_thresh = float(self.tray_monitor.high_threshold or 0) if self.tray_monitor else 0.0
                 min_diff = min(min(diff), low_thresh) - 1
                 max_diff = max(max(diff), high_thresh) + 1
-                self.ax2.set_ylim(min_diff, max_diff)
+            self.ax2.set_ylim(min_diff, max_diff)
 
         # Redraw canvas
         self.canvas.draw_idle()
@@ -1193,6 +1401,8 @@ class CPUTempMonitorApp:
         self.graph_predicted.clear()
         self.graph_diff.clear()
         self.graph_counter = 0
+        for buf in self.graph_per_feature.values():
+            buf.clear()
 
         # Clear plot lines
         self.line_actual.set_data([], [])
@@ -1448,9 +1658,13 @@ class CPUTempMonitorApp:
             # Update status display
             self.update_status()
 
-            messagebox.showinfo("Success",
-                f"Threshold updated to {new_threshold:.1f} std\n"
-                f"New diff range: [{self.tray_monitor.low_threshold:.1f}, {self.tray_monitor.high_threshold:+.1f}]°C")
+            if self.tray_monitor.is_autoencoder_model or self.tray_monitor.is_pca_model:
+                msg = (f"Threshold updated to {new_threshold:.1f} std\n"
+                       f"New error threshold: {self.tray_monitor.high_threshold:.4f}")
+            else:
+                msg = (f"Threshold updated to {new_threshold:.1f} std\n"
+                       f"New diff range: [{self.tray_monitor.low_threshold:.1f}, {self.tray_monitor.high_threshold:+.1f}]°C")
+            messagebox.showinfo("Success", msg)
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to apply threshold:\n{e}")
