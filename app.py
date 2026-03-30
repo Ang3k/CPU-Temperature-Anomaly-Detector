@@ -176,6 +176,11 @@ class CPUTempMonitorApp:
         self.is_monitoring = False
         self.pc_info = None
 
+        # Anomaly log
+        self.anomaly_log = []
+        self.anomaly_log_counter = 0
+        self._last_anomaly_category = ""
+
         # Data collection state
         self.is_collecting = False
         self.collection_thread = None
@@ -196,6 +201,18 @@ class CPUTempMonitorApp:
         self.graph_counter = 0
         self.last_prediction_id = -1
 
+        # Per-feature reconstructed and actual value buffers (autoencoder monitor)
+        self.graph_per_feature_reconstructed = {}
+        self.graph_per_feature_actual = {}
+
+        # Collect tab graph buffers
+        self.collect_graph_max_points = 200
+        self.collect_graph_buffers = {
+            sensor: deque(maxlen=self.collect_graph_max_points)
+            for sensor in ['cpu_temp', 'cpu_load', 'cpu_power', 'gpu_temp', 'gpu_load', 'gpu_power', 'ram_load']
+        }
+        self.collect_graph_times = deque(maxlen=self.collect_graph_max_points)
+
         # Setup UI
         self.setup_ui()
 
@@ -209,16 +226,25 @@ class CPUTempMonitorApp:
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
 
         # Create scrollable tabs
+        self.guide_tab = self.create_scrollable_frame(self.notebook)
+        self.collect_tab = self.create_scrollable_frame(self.notebook)
         self.train_tab = self.create_scrollable_frame(self.notebook)
         self.monitor_tab = self.create_scrollable_frame(self.notebook)
+        self.log_tab = self.create_scrollable_frame(self.notebook)
         self.settings_tab = self.create_scrollable_frame(self.notebook)
 
+        self.notebook.add(self.guide_tab['outer'], text='  Guide  ')
+        self.notebook.add(self.collect_tab['outer'], text='  Collect  ')
         self.notebook.add(self.train_tab['outer'], text='  Train  ')
         self.notebook.add(self.monitor_tab['outer'], text='  Monitor  ')
+        self.notebook.add(self.log_tab['outer'], text='  Log  ')
         self.notebook.add(self.settings_tab['outer'], text='  Settings  ')
 
+        self.setup_guide_tab()
+        self.setup_collect_tab()
         self.setup_train_tab()
         self.setup_monitor_tab()
+        self.setup_log_tab()
         self.setup_settings_tab()
 
     def create_scrollable_frame(self, parent):
@@ -264,26 +290,244 @@ class CPUTempMonitorApp:
 
         return {'outer': outer_frame, 'inner': inner_frame, 'canvas': canvas}
 
+    def setup_guide_tab(self):
+        """Setup the guide/onboarding tab."""
+        frame = self.guide_tab['inner']
+
+        # Welcome
+        welcome_frame = ttk.LabelFrame(frame, text="Welcome", padding=10)
+        welcome_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(welcome_frame, text="CPU Temperature Monitor", font=('TkDefaultFont', 14, 'bold')).pack(anchor='w')
+        ttk.Label(welcome_frame, text=(
+            "This app monitors your computer's sensors (CPU, GPU, RAM) and alerts you when\n"
+            "something unusual is happening — like overheating without heavy usage, or abnormal\n"
+            "power consumption. Follow the tabs left to right to get started."
+        ), font=('TkDefaultFont', 9), justify='left').pack(anchor='w', pady=(5, 0))
+
+        # How it works
+        how_frame = ttk.LabelFrame(frame, text="How Does It Work?", padding=10)
+        how_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(how_frame, text=(
+            "The app uses Machine Learning to learn what \"normal\" looks like for YOUR computer.\n"
+            "It records sensor data while you use your PC normally, then trains a model that\n"
+            "understands the typical patterns — like how temperature rises when you open a game,\n"
+            "or how GPU load relates to power consumption.\n\n"
+            "Once trained, the model runs in the background and compares real-time readings\n"
+            "against what it learned. If something doesn't match the normal pattern, it alerts you."
+        ), font=('TkDefaultFont', 9), justify='left').pack(anchor='w')
+
+        # Step by step
+        steps_frame = ttk.LabelFrame(frame, text="Getting Started — Step by Step", padding=10)
+        steps_frame.pack(fill='x', padx=10, pady=5)
+
+        steps = [
+            ("1. Collect", "Collect tab",
+             "Record sensor data while using your PC normally. The longer you collect,\n"
+             "the better the model understands your computer. Aim for at least 30 minutes\n"
+             "covering your typical usage (browsing, working, gaming, idle).\n"
+             "You can also load previously saved CSV files."),
+            ("2. Train", "Train tab",
+             "Choose a model type and click 'Train From Data'. The app will learn patterns\n"
+             "from the collected data. This may take a few seconds to minutes.\n\n"
+             "  Autoencoder (recommended): Learns patterns across ALL sensors at once.\n"
+             "  It can tell you which specific sensor is behaving unusually.\n\n"
+             "  Regressor: Predicts CPU temperature from other sensors.\n"
+             "  Simpler but only monitors CPU temperature."),
+            ("3. Monitor", "Monitor tab",
+             "Select your trained model and click 'Start Monitoring'. The app minimizes\n"
+             "to the system tray and watches your sensors in real-time.\n\n"
+             "  Green tray icon = everything normal\n"
+             "  Red tray icon = anomaly detected\n\n"
+             "The Sensor Health panel shows which sensors are healthy or anomalous,\n"
+             "and classifies the type of problem (cooling, heavy workload, etc)."),
+            ("4. Log", "Log tab",
+             "Every anomaly is recorded with its timestamp, category, and sensor values.\n"
+             "Use this to track patterns over time — for example, if cooling problems\n"
+             "appear every afternoon, your room might be too warm. You can export the\n"
+             "log to CSV for further analysis."),
+        ]
+
+        for i, (title, tab_name, description) in enumerate(steps):
+            step_frame = ttk.Frame(steps_frame)
+            step_frame.pack(fill='x', pady=(0 if i == 0 else 8, 0))
+
+            ttk.Label(step_frame, text=title, font=('TkDefaultFont', 10, 'bold')).pack(anchor='w')
+            ttk.Label(step_frame, text=description, font=('TkDefaultFont', 9),
+                     justify='left', foreground='#333').pack(anchor='w', padx=(15, 0))
+
+            if i < len(steps) - 1:
+                ttk.Separator(step_frame, orient='horizontal').pack(fill='x', pady=(8, 0))
+
+        # Key concepts
+        concepts_frame = ttk.LabelFrame(frame, text="Key Concepts (simplified)", padding=10)
+        concepts_frame.pack(fill='x', padx=10, pady=5)
+
+        concepts = [
+            ("Anomaly", "Something that doesn't match the normal pattern. Not necessarily dangerous —\n"
+                        "a new game you've never played before might look 'anomalous' to the model."),
+            ("Threshold", "How sensitive the detection is. Higher = fewer alerts (only extreme anomalies).\n"
+                          "Lower = more alerts (catches subtle changes but more false positives)."),
+            ("Reconstruction Error", "How different the current reading is from what the model expected.\n"
+                                     "High error = the model is surprised by what it sees."),
+            ("Window Size", "How many seconds of data the model looks at each time. A window of 60\n"
+                            "means it analyzes the last 60 readings together to spot patterns."),
+        ]
+
+        for i, (term, explanation) in enumerate(concepts):
+            concept_frame = ttk.Frame(concepts_frame)
+            concept_frame.pack(fill='x', pady=(0 if i == 0 else 6, 0))
+
+            ttk.Label(concept_frame, text=f"{term}:", font=('TkDefaultFont', 9, 'bold')).pack(anchor='w')
+            ttk.Label(concept_frame, text=explanation, font=('TkDefaultFont', 9),
+                     foreground='#555', justify='left').pack(anchor='w', padx=(15, 0))
+
+        # Tips
+        tips_frame = ttk.LabelFrame(frame, text="Tips", padding=10)
+        tips_frame.pack(fill='x', padx=10, pady=(5, 15))
+
+        ttk.Label(tips_frame, text=(
+            "- Collect data during your NORMAL daily usage, not just idle or just gaming\n"
+            "- If you get too many false alerts, increase the threshold in the Monitor tab\n"
+            "- Retrain the model every few weeks, or after hardware/software changes\n"
+            "- The app keeps running in the background when you close the window (tray icon)\n"
+            "- Right-click the tray icon to quit completely"
+        ), font=('TkDefaultFont', 9), justify='left', foreground='#555').pack(anchor='w')
+
+        # Get started button
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
+        start_frame = ttk.Frame(frame)
+        start_frame.pack(fill='x', padx=10, pady=10)
+        ttk.Button(start_frame, text="Get Started — Go to Collect →",
+                   command=lambda: self.notebook.select(1)).pack(side='left', padx=5)
+
+    def setup_collect_tab(self):
+        """Setup the data collection tab."""
+        frame = self.collect_tab['inner']
+
+        # Background collection
+        bg_frame = ttk.LabelFrame(frame, text="Background Data Collection", padding=10)
+        bg_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(bg_frame,
+                 text="Continuously collect sensor data in background. Leave running for hours/days.",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(0, 5))
+
+        interval_frame = ttk.Frame(bg_frame)
+        interval_frame.pack(fill='x', pady=(0, 5))
+        ttk.Label(interval_frame, text="Collection Interval (s):").pack(side='left', padx=(0, 5))
+        self.collection_interval_var = tk.DoubleVar(value=self.config.get('collection_interval', 5.0))
+        ttk.Spinbox(interval_frame, from_=1, to=60, increment=1,
+                    textvariable=self.collection_interval_var, width=10).pack(side='left')
+
+        self.collection_status_label = ttk.Label(bg_frame, text="Not collecting", foreground='gray')
+        self.collection_status_label.pack(anchor='w', pady=5)
+
+        ctrl_frame = ttk.Frame(bg_frame)
+        ctrl_frame.pack(fill='x', pady=(0, 5))
+        self.start_collection_btn = ttk.Button(ctrl_frame, text="Start Collection",
+                                               command=self.start_background_collection)
+        self.start_collection_btn.pack(side='left', padx=5)
+        self.stop_collection_btn = ttk.Button(ctrl_frame, text="Stop Collection",
+                                              command=self.stop_background_collection, state='disabled')
+        self.stop_collection_btn.pack(side='left', padx=5)
+
+        mgmt_frame = ttk.Frame(bg_frame)
+        mgmt_frame.pack(fill='x')
+        self.save_collected_btn = ttk.Button(mgmt_frame, text="Save Collected Data",
+                                             command=self.save_background_collected_data, state='disabled')
+        self.save_collected_btn.pack(side='left', padx=5)
+        self.clear_collected_btn = ttk.Button(mgmt_frame, text="Clear Collected Data",
+                                              command=self.clear_background_collected_data, state='disabled')
+        self.clear_collected_btn.pack(side='left', padx=5)
+
+        # Load from CSV
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=10)
+
+        csv_frame = ttk.LabelFrame(frame, text="Load from CSV", padding=10)
+        csv_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(csv_frame,
+                 text="Load previously saved CSV files to use as training data.",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(0, 8))
+
+        csv_btn_frame = ttk.Frame(csv_frame)
+        csv_btn_frame.pack(fill='x')
+        self.load_data_btn = ttk.Button(csv_btn_frame, text="Load Training Data",
+                                        command=self.load_training_data)
+        self.load_data_btn.pack(side='left', padx=5)
+        self.load_multiple_btn = ttk.Button(csv_btn_frame, text="Load & Combine CSVs",
+                                            command=self.load_and_combine_csvs)
+        self.load_multiple_btn.pack(side='left', padx=5)
+
+        # Data status
+        self.collect_data_status_label = ttk.Label(frame, text="", foreground='green',
+                                                    font=('TkDefaultFont', 8, 'bold'))
+        self.collect_data_status_label.pack(anchor='w', padx=15, pady=5)
+
+        # Live graph
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
+
+        collect_graph_frame = ttk.LabelFrame(frame, text="Live Sensor Data", padding=5)
+        collect_graph_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+        sensor_selector_frame = ttk.Frame(collect_graph_frame)
+        sensor_selector_frame.pack(fill='x', pady=(0, 5))
+        ttk.Label(sensor_selector_frame, text="Sensor:").pack(side='left', padx=(0, 5))
+        self.collect_sensor_var = tk.StringVar(value='cpu_temp')
+        self.collect_sensor_combo = ttk.Combobox(
+            sensor_selector_frame, textvariable=self.collect_sensor_var,
+            values=['cpu_temp', 'cpu_load', 'cpu_power', 'gpu_temp', 'gpu_load', 'gpu_power', 'ram_load'],
+            state='readonly', width=16
+        )
+        self.collect_sensor_combo.pack(side='left')
+        self.collect_sensor_combo.bind('<<ComboboxSelected>>', lambda _: self._update_collect_graph())
+
+        self.collect_fig = Figure(figsize=(6, 3), dpi=80)
+        self.collect_fig.set_facecolor('#f0f0f0')
+        self.collect_ax = self.collect_fig.add_subplot(111)
+        self.collect_ax.set_ylabel('Value')
+        self.collect_ax.set_title('cpu_temp', fontsize=9)
+        self.collect_ax.grid(True, alpha=0.3)
+        self.collect_line, = self.collect_ax.plot([], [], 'b-', linewidth=1.5)
+        self.collect_fig.tight_layout()
+
+        self.collect_canvas = FigureCanvasTkAgg(self.collect_fig, master=collect_graph_frame)
+        self.collect_canvas.draw()
+        self.collect_canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        # Go to Train button
+        ttk.Separator(frame, orient='horizontal').pack(fill='x', padx=10, pady=5)
+        go_train_frame = ttk.Frame(frame)
+        go_train_frame.pack(fill='x', padx=10, pady=10)
+        ttk.Button(go_train_frame, text="Go to Train →",
+                   command=lambda: self.notebook.select(2)).pack(side='left', padx=5)
+        ttk.Label(go_train_frame, text="When you have data ready, go train your model.",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(side='left', padx=5)
+
     def setup_train_tab(self):
         """Setup the training tab."""
         frame = self.train_tab['inner']
 
         # Model selection
-        model_frame = ttk.LabelFrame(frame, text="Model Configuration", padding=10)
+        model_frame = ttk.LabelFrame(frame, text="Step 1 — Choose Model", padding=10)
         model_frame.pack(fill='x', padx=10, pady=5)
+
+        # Lock column 0 width so ae_frame never shifts labels
+        model_frame.columnconfigure(0, weight=0, minsize=110)
+        model_frame.columnconfigure(1, weight=0)
 
         # Model approach selection
         ttk.Label(model_frame, text="Approach:").grid(row=0, column=0, sticky='w', pady=2)
         self.model_approach_var = tk.StringVar(value=self.config.get('model_approach', 'regressor'))
         approach_frame = ttk.Frame(model_frame)
-        approach_frame.grid(row=0, column=1, columnspan=2, sticky='w', pady=2)
+        approach_frame.grid(row=0, column=1, sticky='w', pady=2)
 
-        regressor_radio = ttk.Radiobutton(approach_frame, text="Regressor", variable=self.model_approach_var,
-                                          value='regressor', command=self.on_approach_change)
-        regressor_radio.pack(side='left', padx=(0, 15))
-        autoencoder_radio = ttk.Radiobutton(approach_frame, text="Autoencoder", variable=self.model_approach_var,
-                                            value='autoencoder', command=self.on_approach_change)
-        autoencoder_radio.pack(side='left')
+        ttk.Radiobutton(approach_frame, text="Regressor", variable=self.model_approach_var,
+                        value='regressor', command=self.on_approach_change).pack(side='left', padx=(0, 15))
+        ttk.Radiobutton(approach_frame, text="Autoencoder", variable=self.model_approach_var,
+                        value='autoencoder', command=self.on_approach_change).pack(side='left')
 
         # Regressor model type
         ttk.Label(model_frame, text="Regressor:").grid(row=1, column=0, sticky='w', pady=2)
@@ -292,12 +536,25 @@ class CPUTempMonitorApp:
                                             values=['linear', 'xgb', 'lightgbm'], state='readonly', width=12)
         self.regressor_combo.grid(row=1, column=1, pady=2, padx=5, sticky='w')
 
-        # Autoencoder parameters
+        # Scaler
+        ttk.Label(model_frame, text="Scaler:").grid(row=2, column=0, sticky='w', pady=2)
+        self.scaler_var = tk.StringVar(value=self.config.get('last_scaler', 'standard'))
+        scaler_combo = ttk.Combobox(model_frame, textvariable=self.scaler_var,
+                                    values=['standard', 'minmax', 'robust'], state='readonly', width=12)
+        scaler_combo.grid(row=2, column=1, pady=2, padx=5, sticky='w')
+
+        # Multi-variable checkbox
+        self.multi_variable_var = tk.BooleanVar(value=self.config.get('multi_variable', True))
+        ttk.Checkbutton(model_frame, text="Use all sensors (multi-variable mode)",
+                        variable=self.multi_variable_var).grid(row=3, column=0, columnspan=2, sticky='w', pady=5)
+
+        # Autoencoder parameters — spans both columns, isolated from above rows
         self.ae_frame = ttk.LabelFrame(model_frame, text="Autoencoder Parameters", padding=5)
         self.ae_frame.grid(row=4, column=0, columnspan=2, sticky='ew', pady=5)
 
         ttk.Label(self.ae_frame, text="Window Size:").grid(row=0, column=0, sticky='w', pady=2)
         self.ae_window_var = tk.IntVar(value=self.config.get('ae_window_size', 60))
+        self.ae_window_var.trace_add('write', self._update_window_hint)
         ttk.Spinbox(self.ae_frame, from_=10, to=200, increment=10,
                      textvariable=self.ae_window_var, width=10).grid(row=0, column=1, pady=2, padx=5, sticky='w')
 
@@ -315,120 +572,31 @@ class CPUTempMonitorApp:
         ttk.Spinbox(self.ae_frame, from_=8, to=256, increment=8,
                      textvariable=self.ae_batch_var, width=10).grid(row=1, column=3, pady=2, padx=5, sticky='w')
 
-        # Scaler
-        ttk.Label(model_frame, text="Scaler:").grid(row=2, column=0, sticky='w', pady=2)
-        self.scaler_var = tk.StringVar(value=self.config.get('last_scaler', 'standard'))
-        scaler_combo = ttk.Combobox(model_frame, textvariable=self.scaler_var,
-                                    values=['standard', 'minmax', 'robust'], state='readonly', width=12)
-        scaler_combo.grid(row=2, column=1, pady=2, padx=5, sticky='w')
-
-        # Multi-variable checkbox
-        self.multi_variable_var = tk.BooleanVar(value=self.config.get('multi_variable', True))
-        multi_var_check = ttk.Checkbutton(model_frame, text="Use all sensors (multi-variable mode)",
-                                          variable=self.multi_variable_var)
-        multi_var_check.grid(row=3, column=0, columnspan=2, sticky='w', pady=5)
-
         # Initialize UI state based on current approach
         self.on_approach_change()
 
         # Training parameters
-        param_frame = ttk.LabelFrame(frame, text="Training Parameters", padding=10)
+        param_frame = ttk.LabelFrame(frame, text="Step 1 (cont.) — Training Parameters", padding=10)
         param_frame.pack(fill='x', padx=10, pady=5)
 
-        ttk.Label(param_frame, text="Mean Time (s):").grid(row=0, column=0, sticky='w', pady=2)
-        self.mean_time_var = tk.IntVar(value=self.config.get('mean_time', 0))
-        mean_time_spin = ttk.Spinbox(param_frame, from_=0, to=300, increment=5,
-                                     textvariable=self.mean_time_var, width=10)
-        mean_time_spin.grid(row=0, column=1, pady=2, padx=5)
+        self.window_hint_label = ttk.Label(param_frame, text="", foreground='#1565C0',
+                                           font=('TkDefaultFont', 8, 'bold'))
+        self.window_hint_label.grid(row=0, column=0, columnspan=3, sticky='w', pady=2)
 
-        ttk.Label(param_frame, text="(0 = no resampling, >0 = average over window)",
-                 font=('TkDefaultFont', 8), foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=2)
-
-        # Training data management
-        data_frame = ttk.LabelFrame(frame, text="Training Data Collection", padding=10)
-        data_frame.pack(fill='x', padx=10, pady=5)
-
-        # Background auto-collection
-        ttk.Label(data_frame, text="Background Data Collection:",
-                 font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', pady=(0, 5))
-
-        ttk.Label(data_frame,
-                 text="Continuously collect sensor data in background. Leave running for hours/days.",
-                 font=('TkDefaultFont', 8),
-                 foreground='gray').pack(anchor='w', pady=(0, 5))
-
-        # Collection interval
-        interval_frame = ttk.Frame(data_frame)
-        interval_frame.pack(fill='x', pady=(0, 5))
-
-        ttk.Label(interval_frame, text="Collection Interval (s):").pack(side='left', padx=(0, 5))
-        self.collection_interval_var = tk.DoubleVar(value=self.config.get('collection_interval', 5.0))
-        interval_spin = ttk.Spinbox(interval_frame, from_=1, to=60, increment=1,
-                                    textvariable=self.collection_interval_var, width=10)
-        interval_spin.pack(side='left')
-
-        # Collection status
-        self.collection_status_label = ttk.Label(data_frame, text="Not collecting", foreground='gray')
-        self.collection_status_label.pack(anchor='w', pady=5)
-
-        # Collection control buttons
-        collection_ctrl_frame = ttk.Frame(data_frame)
-        collection_ctrl_frame.pack(fill='x', pady=(0, 10))
-
-        self.start_collection_btn = ttk.Button(collection_ctrl_frame, text="Start Collection",
-                                               command=self.start_background_collection)
-        self.start_collection_btn.pack(side='left', padx=5)
-
-        self.stop_collection_btn = ttk.Button(collection_ctrl_frame, text="Stop Collection",
-                                              command=self.stop_background_collection, state='disabled')
-        self.stop_collection_btn.pack(side='left', padx=5)
-
-        # Save/Clear collected data
-        data_mgmt_frame = ttk.Frame(data_frame)
-        data_mgmt_frame.pack(fill='x', pady=(0, 10))
-
-        self.save_collected_btn = ttk.Button(data_mgmt_frame, text="Save Collected Data",
-                                             command=self.save_background_collected_data, state='disabled')
-        self.save_collected_btn.pack(side='left', padx=5)
-
-        self.clear_collected_btn = ttk.Button(data_mgmt_frame, text="Clear Collected Data",
-                                              command=self.clear_background_collected_data, state='disabled')
-        self.clear_collected_btn.pack(side='left', padx=5)
-
-        # Separator
-        ttk.Separator(data_frame, orient='horizontal').pack(fill='x', pady=10)
-
-        # Manual training data buttons
-        ttk.Label(data_frame, text="Manual Training Data:",
-                 font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', pady=(0, 5))
-
-        manual_data_frame = ttk.Frame(data_frame)
-        manual_data_frame.pack(fill='x')
-
-        self.save_data_btn = ttk.Button(manual_data_frame, text="Save Training Data", command=self.save_training_data, state='disabled')
-        self.save_data_btn.pack(side='left', padx=5)
-
-        self.load_data_btn = ttk.Button(manual_data_frame, text="Load Training Data", command=self.load_training_data)
-        self.load_data_btn.pack(side='left', padx=5)
-
-        self.load_multiple_btn = ttk.Button(manual_data_frame, text="Load & Combine CSVs", command=self.load_and_combine_csvs)
-        self.load_multiple_btn.pack(side='left', padx=5)
-
-        # Progress
-        progress_frame = ttk.LabelFrame(frame, text="Progress", padding=10)
-        progress_frame.pack(fill='x', padx=10, pady=5)
+        # Step 2: Train
+        train_action_frame = ttk.LabelFrame(frame, text="Step 2 — Train", padding=10)
+        train_action_frame.pack(fill='x', padx=10, pady=5)
 
         self.progress_var = tk.DoubleVar(value=0)
-        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
+        self.progress_bar = ttk.Progressbar(train_action_frame, variable=self.progress_var,
                                             maximum=100, length=400)
         self.progress_bar.pack(fill='x', pady=5)
 
-        self.progress_label = ttk.Label(progress_frame, text="Ready to train")
+        self.progress_label = ttk.Label(train_action_frame, text="Waiting for data — collect or load data in the Collect tab first")
         self.progress_label.pack()
 
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill='x', padx=10, pady=10)
+        btn_frame = ttk.Frame(train_action_frame)
+        btn_frame.pack(fill='x', pady=(8, 0))
 
         self.train_from_data_btn = ttk.Button(
             btn_frame,
@@ -438,18 +606,28 @@ class CPUTempMonitorApp:
         )
         self.train_from_data_btn.pack(side='left', padx=5)
 
-        self.save_btn = ttk.Button(btn_frame, text="Save Model", command=self.save_model, state='disabled')
-        self.save_btn.pack(side='left', padx=5)
-
         self.stop_train_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_training, state='disabled')
         self.stop_train_btn.pack(side='left', padx=5)
 
-        # Metrics display
-        metrics_frame = ttk.LabelFrame(frame, text="Training Metrics", padding=10)
-        metrics_frame.pack(fill='x', padx=10, pady=5)
+        # Step 3: Save
+        save_action_frame = ttk.LabelFrame(frame, text="Step 3 — Save & Use Model", padding=10)
+        save_action_frame.pack(fill='x', padx=10, pady=5)
 
-        self.metrics_label = ttk.Label(metrics_frame, text="Train a model to see metrics")
-        self.metrics_label.pack()
+        self.metrics_label = ttk.Label(save_action_frame, text="Train a model to see metrics")
+        self.metrics_label.pack(anchor='w')
+
+        save_btn_frame = ttk.Frame(save_action_frame)
+        save_btn_frame.pack(fill='x', pady=(8, 0))
+
+        self.save_btn = ttk.Button(save_btn_frame, text="Save Model", command=self.save_model, state='disabled')
+        self.save_btn.pack(side='left', padx=5)
+
+        self.save_data_btn_step4 = ttk.Button(save_btn_frame, text="Save Training Data", command=self.save_training_data, state='disabled')
+        self.save_data_btn_step4.pack(side='left', padx=5)
+
+        ttk.Label(save_action_frame,
+                 text="After saving, the model is automatically loaded in the Monitor tab.",
+                 font=('TkDefaultFont', 8), foreground='gray').pack(anchor='w', pady=(4, 0))
 
     def setup_monitor_tab(self):
         """Setup the monitoring tab."""
@@ -467,6 +645,10 @@ class CPUTempMonitorApp:
         browse_btn = ttk.Button(model_frame, text="Browse", command=self.browse_model)
         browse_btn.grid(row=0, column=2, pady=2, padx=5)
 
+        self.monitor_model_hint = ttk.Label(model_frame, text="", foreground='green',
+                                            font=('TkDefaultFont', 8))
+        self.monitor_model_hint.grid(row=0, column=3, padx=(5, 0), sticky='w')
+
         # Threshold
         ttk.Label(model_frame, text="Threshold (std):").grid(row=1, column=0, sticky='w', pady=2)
         self.threshold_var = tk.DoubleVar(value=self.config.get('threshold_std', 1.5))
@@ -477,28 +659,18 @@ class CPUTempMonitorApp:
         self.apply_threshold_btn = ttk.Button(model_frame, text="Apply Threshold", command=self.apply_threshold, state='disabled')
         self.apply_threshold_btn.grid(row=1, column=2, pady=2, padx=5)
 
-        # Mean time for monitor predictions
-        ttk.Label(model_frame, text="Mean Time (s):").grid(row=2, column=0, sticky='w', pady=2)
-        self.monitor_mean_time_var = tk.IntVar(value=self.config.get('monitor_mean_time', 0))
-        monitor_mean_spin = ttk.Spinbox(model_frame, from_=0, to=300, increment=1,
-                                        textvariable=self.monitor_mean_time_var, width=10)
-        monitor_mean_spin.grid(row=2, column=1, pady=2, padx=5, sticky='w')
-        ttk.Label(model_frame, text="(0 = no averaging; >0 = mean of X seconds)",
-                 font=('TkDefaultFont', 8), foreground='gray').grid(row=3, column=0, columnspan=3, sticky='w', pady=2)
-
         # Anomaly window (consecutive points)
-        ttk.Label(model_frame, text="Anomaly Window (points):").grid(row=4, column=0, sticky='w', pady=2)
+        ttk.Label(model_frame, text="Anomaly Window (points):").grid(row=2, column=0, sticky='w', pady=2)
         self.monitor_anomaly_window_var = tk.IntVar(value=self.config.get('monitor_anomaly_window', 1))
         anomaly_window_spin = ttk.Spinbox(model_frame, from_=1, to=300, increment=1,
                                           textvariable=self.monitor_anomaly_window_var, width=10)
-        anomaly_window_spin.grid(row=4, column=1, pady=2, padx=5, sticky='w')
+        anomaly_window_spin.grid(row=2, column=1, pady=2, padx=5, sticky='w')
         self.anomaly_window_time_label = ttk.Label(model_frame, text="", foreground='gray')
-        self.anomaly_window_time_label.grid(row=4, column=2, sticky='w', pady=2)
+        self.anomaly_window_time_label.grid(row=2, column=2, sticky='w', pady=2)
         ttk.Label(model_frame, text="(Requires N consecutive points over threshold)",
-                 font=('TkDefaultFont', 8), foreground='gray').grid(row=5, column=0, columnspan=3, sticky='w', pady=2)
+                 font=('TkDefaultFont', 8), foreground='gray').grid(row=3, column=0, columnspan=3, sticky='w', pady=2)
 
         # Dynamic window time label updates
-        self.monitor_mean_time_var.trace_add('write', self.update_anomaly_window_time)
         self.monitor_anomaly_window_var.trace_add('write', self.update_anomaly_window_time)
         self.update_anomaly_window_time()
 
@@ -521,7 +693,7 @@ class CPUTempMonitorApp:
 
         # Feature selector for autoencoder (hidden by default)
         self.ae_feature_frame = ttk.Frame(graph_frame)
-        ttk.Label(self.ae_feature_frame, text="Show Error:").pack(side='left', padx=(0, 5))
+        ttk.Label(self.ae_feature_frame, text="Show Sensor:").pack(side='left', padx=(0, 5))
         self.ae_feature_var = tk.StringVar(value='All (Global)')
         self.ae_feature_combo = ttk.Combobox(self.ae_feature_frame, textvariable=self.ae_feature_var,
                                               state='readonly', width=20)
@@ -563,6 +735,29 @@ class CPUTempMonitorApp:
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill='both', expand=True)
 
+        # Sensor health panel (autoencoder only, hidden by default)
+        self.sensor_health_frame = ttk.LabelFrame(frame, text="Sensor Health", padding=5)
+
+        sensor_names = ['cpu_temp', 'cpu_load', 'cpu_power', 'gpu_temp', 'gpu_load', 'gpu_power', 'ram_load']
+        sensor_labels = ['CPU Temp', 'CPU Load', 'CPU Power', 'GPU Temp', 'GPU Load', 'GPU Power', 'RAM Load']
+        self.sensor_health_indicators = {}
+        for i, (key, label) in enumerate(zip(sensor_names, sensor_labels)):
+            col = i % 4
+            row = i // 4
+            cell_frame = tk.Frame(self.sensor_health_frame)
+            cell_frame.grid(row=row, column=col, padx=6, pady=3, sticky='w')
+            ttk.Label(cell_frame, text=f"{label}:", font=('TkDefaultFont', 8)).pack(side='left')
+            status_lbl = tk.Label(cell_frame, text=" Healthy ", font=('TkDefaultFont', 8, 'bold'),
+                                  bg='#4CAF50', fg='white', padx=4, pady=1)
+            status_lbl.pack(side='left', padx=(4, 0))
+            self.sensor_health_indicators[key] = status_lbl
+
+        # Anomaly category label
+        self.anomaly_category_label = tk.Label(self.sensor_health_frame, text="",
+                                                font=('TkDefaultFont', 9, 'bold'),
+                                                fg='#333', pady=4)
+        self.anomaly_category_label.grid(row=2, column=0, columnspan=4, sticky='w', padx=6, pady=(6, 0))
+
         # Status (compact)
         status_frame = ttk.LabelFrame(frame, text="Status", padding=5)
         status_frame.pack(fill='x', padx=10, pady=5)
@@ -602,16 +797,211 @@ class CPUTempMonitorApp:
         except Exception:
             points = 1
 
-        try:
-            mean_time = int(self.monitor_mean_time_var.get() or 0)
-        except Exception:
-            mean_time = 0
+        mean_time = 0
 
         points = max(1, points)
         seconds_per_point = mean_time if mean_time > 0 else 1
         total_seconds = points * seconds_per_point
         formatted = self._format_duration(total_seconds)
         self.anomaly_window_time_label.config(text=f"= {formatted}")
+
+    def setup_log_tab(self):
+        """Setup the anomaly log tab."""
+        frame = self.log_tab['inner']
+
+        # Summary stats
+        summary_frame = ttk.LabelFrame(frame, text="Summary", padding=10)
+        summary_frame.pack(fill='x', padx=10, pady=5)
+
+        self.log_summary_label = ttk.Label(summary_frame, text="No anomalies recorded yet",
+                                            font=('TkDefaultFont', 9))
+        self.log_summary_label.pack(anchor='w')
+
+        # Log table
+        table_frame = ttk.LabelFrame(frame, text="Anomaly History", padding=5)
+        table_frame.pack(fill='both', expand=True, padx=10, pady=5)
+
+        columns = ('time', 'category', 'sensors', 'cpu_temp', 'gpu_temp', 'error')
+        self.log_tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=15)
+
+        self.log_tree.heading('time', text='Time')
+        self.log_tree.heading('category', text='Category')
+        self.log_tree.heading('sensors', text='Anomalous Sensors')
+        self.log_tree.heading('cpu_temp', text='CPU Temp')
+        self.log_tree.heading('gpu_temp', text='GPU Temp')
+        self.log_tree.heading('error', text='Global Error')
+
+        self.log_tree.column('time', width=80, minwidth=70)
+        self.log_tree.column('category', width=180, minwidth=120)
+        self.log_tree.column('sensors', width=150, minwidth=100)
+        self.log_tree.column('cpu_temp', width=70, minwidth=60, anchor='center')
+        self.log_tree.column('gpu_temp', width=70, minwidth=60, anchor='center')
+        self.log_tree.column('error', width=80, minwidth=60, anchor='center')
+
+        # Scrollbar
+        log_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.log_tree.yview)
+        self.log_tree.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side='right', fill='y')
+        self.log_tree.pack(fill='both', expand=True)
+
+        # Tag for coloring rows
+        self.log_tree.tag_configure('cooling', background='#FFCDD2')
+        self.log_tree.tag_configure('workload', background='#FFF9C4')
+        self.log_tree.tag_configure('gpu', background='#E1BEE7')
+        self.log_tree.tag_configure('power', background='#FFECB3')
+        self.log_tree.tag_configure('memory', background='#B3E5FC')
+        self.log_tree.tag_configure('spike', background='#F5F5F5')
+        self.log_tree.tag_configure('unknown', background='#E0E0E0')
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill='x', padx=10, pady=10)
+
+        ttk.Button(btn_frame, text="Export to CSV", command=self._export_log).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Clear Log", command=self._clear_log).pack(side='left', padx=5)
+
+    def _get_log_tag(self, category: str) -> str:
+        """Return the treeview tag for a given anomaly category."""
+        cat_lower = category.lower()
+        if 'cooling' in cat_lower:
+            return 'cooling'
+        if 'heavy workload' in cat_lower or 'high load' in cat_lower or 'cpu heavy' in cat_lower:
+            return 'workload'
+        if 'gpu' in cat_lower:
+            return 'gpu'
+        if 'power' in cat_lower:
+            return 'power'
+        if 'memory' in cat_lower:
+            return 'memory'
+        if 'spike' in cat_lower:
+            return 'spike'
+        return 'unknown'
+
+    def _log_anomaly(self, category: str, anomalous_sensors: set):
+        """Log an anomaly event to the log tab."""
+        from datetime import datetime
+
+        now = datetime.now()
+        timestamp = now.strftime('%H:%M:%S')
+
+        # Get current sensor values
+        cpu_temp = f"{self.tray_monitor.current_temp:.1f}°C" if self.tray_monitor else "—"
+        gpu_temp = "—"
+        if self.tray_monitor and self.tray_monitor.last_sensor_data:
+            gt = self.tray_monitor.last_sensor_data.get('gpu_temp', 0)
+            gpu_temp = f"{gt:.1f}°C" if gt else "—"
+        global_error = f"{self.tray_monitor.reconstruction_error:.4f}" if self.tray_monitor else "—"
+
+        sensors_str = ', '.join(sorted(anomalous_sensors))
+        tag = self._get_log_tag(category)
+
+        entry = {
+            'datetime': now,
+            'time': timestamp,
+            'category': category,
+            'sensors': sensors_str,
+            'cpu_temp': cpu_temp,
+            'gpu_temp': gpu_temp,
+            'global_error': global_error,
+            'tag': tag,
+        }
+        self.anomaly_log.append(entry)
+        self.anomaly_log_counter += 1
+
+        # Insert at top of treeview
+        self.log_tree.insert('', 0, values=(
+            timestamp, category, sensors_str, cpu_temp, gpu_temp, global_error
+        ), tags=(tag,))
+
+        # Update summary
+        self._update_log_summary()
+
+    def _update_log_summary(self):
+        """Update the log summary stats."""
+        total = len(self.anomaly_log)
+        if total == 0:
+            self.log_summary_label.config(text="No anomalies recorded yet")
+            return
+
+        # Count by category tag
+        tag_counts = {}
+        for entry in self.anomaly_log:
+            tag = entry.get('tag', 'unknown')
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+        # Time range
+        first = self.anomaly_log[0]['datetime']
+        last = self.anomaly_log[-1]['datetime']
+        from datetime import datetime
+        duration = last - first
+        hours = duration.total_seconds() / 3600
+
+        # Most common category
+        most_common = max(tag_counts, key=tag_counts.get)
+        tag_labels = {
+            'cooling': 'Cooling problems',
+            'workload': 'Heavy workloads',
+            'gpu': 'GPU isolated',
+            'power': 'Power anomalies',
+            'memory': 'Memory pressure',
+            'spike': 'Single sensor spikes',
+            'unknown': 'Unknown patterns',
+        }
+
+        lines = [f"Total: {total} anomalies"]
+        if hours >= 0.01:
+            rate = total / hours
+            lines.append(f"Rate: {rate:.1f}/hour ({hours:.1f}h monitored)")
+        lines.append(f"Most common: {tag_labels.get(most_common, most_common)} ({tag_counts[most_common]}x)")
+
+        self.log_summary_label.config(text='  |  '.join(lines))
+
+    def _export_log(self):
+        """Export the anomaly log to a CSV file."""
+        if not self.anomaly_log:
+            messagebox.showinfo("Export", "No anomalies to export")
+            return
+
+        os.makedirs('data', exist_ok=True)
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_name = f"anomaly_log_{timestamp}.csv"
+
+        path = filedialog.asksaveasfilename(
+            initialdir='data',
+            initialfile=default_name,
+            title="Export Anomaly Log",
+            filetypes=[("CSV files", "*.csv")],
+            defaultextension=".csv"
+        )
+        if path:
+            import csv
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['datetime', 'time', 'category', 'anomalous_sensors', 'cpu_temp', 'gpu_temp', 'global_error'])
+                for entry in self.anomaly_log:
+                    writer.writerow([
+                        entry['datetime'].isoformat(),
+                        entry['time'],
+                        entry['category'],
+                        entry['sensors'],
+                        entry['cpu_temp'],
+                        entry['gpu_temp'],
+                        entry['global_error'],
+                    ])
+            messagebox.showinfo("Export", f"Exported {len(self.anomaly_log)} entries to:\n{path}")
+
+    def _clear_log(self):
+        """Clear the anomaly log."""
+        if not self.anomaly_log:
+            return
+        if messagebox.askyesno("Clear Log", f"Clear all {len(self.anomaly_log)} log entries?"):
+            self.anomaly_log.clear()
+            self.anomaly_log_counter = 0
+            self._last_anomaly_category = ""
+            for item in self.log_tree.get_children():
+                self.log_tree.delete(item)
+            self._update_log_summary()
 
     def setup_settings_tab(self):
         """Setup the settings tab."""
@@ -694,11 +1084,37 @@ class CPUTempMonitorApp:
         approach = self.model_approach_var.get()
         if approach == 'regressor':
             self.regressor_combo.config(state='readonly')
-            self.ae_frame.grid()
-            self.ae_frame.grid_remove()
+            # Hide contents but keep ae_frame occupying space
+            for child in self.ae_frame.winfo_children():
+                child.grid_remove()
+            self.ae_frame.configure(text="")
         else:  # autoencoder
             self.regressor_combo.config(state='disabled')
-            self.ae_frame.grid()
+            for child in self.ae_frame.winfo_children():
+                child.grid()
+            self.ae_frame.configure(text="Autoencoder Parameters")
+        self._update_window_hint()
+
+    def _update_window_hint(self, *_):
+        """Show how much time each detection window covers."""
+        if not hasattr(self, 'window_hint_label'):
+            return
+
+        approach = self.model_approach_var.get() if hasattr(self, 'model_approach_var') else 'regressor'
+        if approach != 'autoencoder':
+            self.window_hint_label.config(text="")
+            return
+
+        mean_time = 0
+        try:
+            window_size = int(self.ae_window_var.get() or 60)
+        except Exception:
+            window_size = 60
+
+        seconds_per_step = mean_time if mean_time > 0 else 1
+        total_seconds = window_size * seconds_per_step
+        duration = self._format_duration(total_seconds)
+        self.window_hint_label.config(text=f"Suas janelas de detecção serão de {duration}")
 
     def browse_model(self):
         """Open file dialog to select a model."""
@@ -715,9 +1131,19 @@ class CPUTempMonitorApp:
         """Enable/disable training from existing data based on availability."""
         has_loaded = self.training_data_df is not None and len(self.training_data_df) > 0
         has_collected = len(self.collected_background_data) > 0
-        state = 'normal' if (has_loaded or has_collected) else 'disabled'
+        has_data = has_loaded or has_collected
+        state = 'normal' if has_data else 'disabled'
         if hasattr(self, 'train_from_data_btn'):
             self.train_from_data_btn.config(state=state)
+            hint = "Waiting for data — collect or load data in the Collect tab first"
+            if has_data and self.progress_label.cget('text') == hint:
+                self.progress_label.config(text="Ready to train")
+        if hasattr(self, 'collect_data_status_label'):
+            if has_data:
+                n = len(self.training_data_df) if has_loaded else len(self.collected_background_data)
+                self.collect_data_status_label.config(text=f"{n} rows ready for training")
+            else:
+                self.collect_data_status_label.config(text="")
 
     def train_from_existing_data(self):
         """Train a model using already collected or loaded data."""
@@ -811,7 +1237,7 @@ class CPUTempMonitorApp:
                 self.root.after(0, lambda: self.progress_label.config(text="Training complete!"))
                 self.root.after(0, lambda: self.progress_var.set(100))
                 self.root.after(0, lambda: self.save_btn.config(state='normal'))
-                self.root.after(0, lambda: self.save_data_btn.config(state='normal'))
+                self.root.after(0, lambda: self.save_data_btn_step4.config(state='normal'))
                 self.root.after(0, self.update_train_from_data_state)
 
             except Exception as e:
@@ -861,15 +1287,19 @@ class CPUTempMonitorApp:
 
         if path:
             self.regressor.save_model(path)
-            messagebox.showinfo("Success", f"Model saved to:\n{path}")
+            messagebox.showinfo("Success", f"Model saved to:\n{path}\n\nSwitching to Monitor tab — model is ready to use.")
             self.model_path_var.set(path)
+            # Switch to Monitor tab and show hint
+            self.notebook.select(3)
+            if hasattr(self, 'monitor_model_hint'):
+                self.monitor_model_hint.config(text="Model loaded from training")
+                self.root.after(5000, lambda: self.monitor_model_hint.config(text=""))
 
             # Update config
             self.config.set('model_approach', approach)
             self.config.set('last_model_type', self.model_type_var.get())
             self.config.set('last_scaler', self.scaler_var.get())
             self.config.set('multi_variable', self.multi_variable_var.get())
-            self.config.set('mean_time', self.mean_time_var.get())
             self.config.set('model_path', path)
             if approach == 'autoencoder':
                 self.config.set('ae_window_size', self.ae_window_var.get())
@@ -930,19 +1360,8 @@ class CPUTempMonitorApp:
             if 'timestamp' in data_df.columns:
                 data_df['timestamp'] = pd.to_datetime(data_df['timestamp'])
 
-            # Apply mean_time resampling if specified
-            mean_time = self.mean_time_var.get()
-            if mean_time > 0 and 'timestamp' in data_df.columns:
-                original_rows = len(data_df)
-                data_df = data_df.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
-                # Recreate sequential time column
-                if 'time' in data_df.columns:
-                    data_df['time'] = range(len(data_df))
-                rows = len(data_df)
-                resample_msg = f"\n(Resampled from {original_rows} to {rows} rows using {mean_time}s window)"
-            else:
-                rows = len(data_df)
-                resample_msg = ""
+            rows = len(data_df)
+            resample_msg = ""
 
             self.training_data_df = data_df
             self.update_train_from_data_state()
@@ -957,7 +1376,7 @@ class CPUTempMonitorApp:
                 self.train_from_existing_data()
             else:
                 self.progress_label.config(text=f"Loaded {rows} rows - ready to train")
-                self.save_data_btn.config(state='normal')
+                self.save_data_btn_step4.config(state='normal')
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load data:\n{e}")
@@ -1003,18 +1422,7 @@ class CPUTempMonitorApp:
                 if 'time' in combined_df.columns:
                     combined_df['time'] = range(len(combined_df))
 
-            # Apply mean_time resampling if specified
-            mean_time = self.mean_time_var.get()
-            if mean_time > 0 and 'timestamp' in combined_df.columns:
-                before_resample = len(combined_df)
-                combined_df = combined_df.resample(f"{mean_time}s", on='timestamp').mean().reset_index()
-                # Recreate sequential time column after resampling
-                if 'time' in combined_df.columns:
-                    combined_df['time'] = range(len(combined_df))
-                after_resample = len(combined_df)
-                resample_msg = f"\nResampled: {before_resample} → {after_resample} rows ({mean_time}s window)"
-            else:
-                resample_msg = ""
+            resample_msg = ""
 
             final_rows = len(combined_df)
             self.training_data_df = combined_df
@@ -1036,7 +1444,7 @@ class CPUTempMonitorApp:
                 self.train_from_existing_data()
             else:
                 self.progress_label.config(text=f"Combined {len(paths)} files ({final_rows} rows) - ready to train")
-                self.save_data_btn.config(state='normal')
+                self.save_data_btn_step4.config(state='normal')
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to combine CSV files:\n{e}")
@@ -1061,7 +1469,7 @@ class CPUTempMonitorApp:
                 notifications_enabled=self.notifications_var.get(),
                 on_open_gui=self.show_window,
                 on_quit_app=self.quit_application,
-                mean_time=self.monitor_mean_time_var.get(),
+                mean_time=0,
                 anomaly_window=self.monitor_anomaly_window_var.get()
             )
             if not self.tray_monitor.load_model():
@@ -1093,12 +1501,13 @@ class CPUTempMonitorApp:
         is_ae = self.tray_monitor and self.tray_monitor.is_autoencoder_model
 
         if is_ae:
-            # Subplot 1: only actual temperature (no prediction)
-            self.ax1.set_title('CPU Temperature', fontsize=9)
-            self.ax1.set_ylabel('Temperature')
-            self.line_actual.set_label('Actual')
-            self.line_predicted.set_label('')
-            self.line_predicted.set_linestyle('None')
+            # Subplot 1: actual + reconstructed
+            self.ax1.set_title('cpu_temp — Actual vs Reconstructed', fontsize=9)
+            self.ax1.set_ylabel('Value')
+            self.line_actual.set_label('cpu_temp actual')
+            self.line_predicted.set_label('cpu_temp reconstructed')
+            self.line_predicted.set_linestyle('--')
+            self.line_predicted.set_color('r')
             self.ax1.legend(loc='upper left', fontsize=8)
 
             # Subplot 2: reconstruction error with threshold
@@ -1130,23 +1539,102 @@ class CPUTempMonitorApp:
             self.line_high_thresh.set_linewidth(1.5)
             self.ax2.legend(loc='upper left', fontsize=8)
 
-        # Show/hide autoencoder feature selector
+        # Show/hide autoencoder feature selector and sensor health panel
         if is_ae:
             features = getattr(self.tray_monitor.regressor, 'feature_columns', [])
             self.ae_feature_combo['values'] = ['All (Global)'] + list(features)
             self.ae_feature_var.set('All (Global)')
             self.ae_feature_frame.pack(fill='x', pady=(0, 5))
+            self.sensor_health_frame.pack(fill='x', padx=10, pady=5)
             # Init per-feature history buffers
             self.graph_per_feature = {col: deque(maxlen=self.graph_max_points) for col in features}
+            self.graph_per_feature_reconstructed = {col: deque(maxlen=self.graph_max_points) for col in features}
+            self.graph_per_feature_actual = {col: deque(maxlen=self.graph_max_points) for col in features}
         else:
             self.ae_feature_frame.pack_forget()
+            self.sensor_health_frame.pack_forget()
             self.graph_per_feature = {}
+            self.graph_per_feature_reconstructed = {}
+            self.graph_per_feature_actual = {}
 
         self.canvas.draw_idle()
 
     def _on_ae_feature_change(self, event=None):
         """Handle autoencoder feature dropdown change — redraw graph immediately."""
         self.update_graph()
+
+    def _classify_anomaly(self, anomalous_sensors: set) -> str:
+        """Classify the type of anomaly based on which sensors are flagged."""
+        if not anomalous_sensors:
+            return ""
+
+        temps = anomalous_sensors & {'cpu_temp', 'gpu_temp'}
+        loads = anomalous_sensors & {'cpu_load', 'gpu_load', 'ram_load'}
+        powers = anomalous_sensors & {'cpu_power', 'gpu_power'}
+
+        gpu_only = anomalous_sensors <= {'gpu_temp', 'gpu_load', 'gpu_power'}
+        cpu_only = anomalous_sensors <= {'cpu_temp', 'cpu_load', 'cpu_power'}
+
+        if len(anomalous_sensors) == 1:
+            sensor = next(iter(anomalous_sensors))
+            if sensor == 'ram_load':
+                return "Memory pressure — unusual RAM usage"
+            return f"Single sensor spike — {sensor} (low confidence)"
+
+        if temps and not loads and not powers:
+            return "Cooling problem — temperature high without load"
+
+        if gpu_only:
+            return "GPU isolated — likely heavy rendering or gaming"
+
+        if cpu_only and loads:
+            return "CPU heavy workload — unusual CPU usage pattern"
+
+        if powers and not loads:
+            return "Power anomaly — unusual power draw without load"
+
+        if temps and loads and powers:
+            return "Heavy workload — all sensors elevated"
+
+        if temps and loads:
+            return "High load with temperature — system under stress"
+
+        return f"Unknown pattern — {', '.join(sorted(anomalous_sensors))}"
+
+    def _update_sensor_health(self):
+        """Update the sensor health panel based on per-feature errors."""
+        if not hasattr(self, 'sensor_health_indicators'):
+            return
+        if not self.tray_monitor or not self.tray_monitor.is_autoencoder_model:
+            return
+
+        per_feat_errors = self.tray_monitor.per_feature_errors
+        if not per_feat_errors:
+            return
+
+        per_feat_thresholds = getattr(self.tray_monitor.regressor, 'per_feature_thresholds', {})
+        anomalous = set()
+
+        for sensor, indicator in self.sensor_health_indicators.items():
+            error = per_feat_errors.get(sensor, 0.0)
+            threshold = per_feat_thresholds.get(sensor, float('inf'))
+
+            if error > threshold:
+                indicator.config(text=" Anomaly ", bg='#F44336', fg='white')
+                anomalous.add(sensor)
+            else:
+                indicator.config(text=" Healthy ", bg='#4CAF50', fg='white')
+
+        category = self._classify_anomaly(anomalous)
+        if category:
+            self.anomaly_category_label.config(text=category, fg='#D32F2F')
+            # Log only when entering a new anomaly or category changes
+            if category != self._last_anomaly_category:
+                self._log_anomaly(category, anomalous)
+            self._last_anomaly_category = category
+        else:
+            self.anomaly_category_label.config(text="All systems normal", fg='#388E3C')
+            self._last_anomaly_category = ""
 
     def _get_ae_graph_data(self):
         """Return (error_values, threshold) for the currently selected autoencoder feature."""
@@ -1197,22 +1685,33 @@ class CPUTempMonitorApp:
             self.graph_actual.append(self.tray_monitor.current_temp)
 
             if self.tray_monitor.is_autoencoder_model:
-                # No predicted temp — store actual again (hidden line) and recon error as diff
                 self.graph_predicted.append(self.tray_monitor.current_temp)
                 self.graph_diff.append(self.tray_monitor.reconstruction_error)
-                # Store per-feature errors for autoencoder
-                if self.tray_monitor.is_autoencoder_model and self.tray_monitor.per_feature_errors:
+
+                # Always buffer actual sensor values per feature
+                sensor_data = self.tray_monitor.last_sensor_data
+                for col in self.graph_per_feature_actual:
+                    self.graph_per_feature_actual[col].append(sensor_data.get(col, 0.0) or 0.0)
+
+                # Buffer per-feature errors and reconstructed values (available after window fills)
+                if self.tray_monitor.per_feature_errors:
                     for col, err in self.tray_monitor.per_feature_errors.items():
                         if col in self.graph_per_feature:
                             self.graph_per_feature[col].append(err)
+                recon = self.tray_monitor.per_feature_reconstructed
+                if recon:
+                    for col, val in recon.items():
+                        if col in self.graph_per_feature_reconstructed:
+                            self.graph_per_feature_reconstructed[col].append(val)
             else:
                 self.graph_predicted.append(self.tray_monitor.predicted_temp)
                 self.graph_diff.append(self.tray_monitor.last_diff)
 
             self.graph_counter += 1
 
-            # Update graph
+            # Update graph and sensor health
             self.update_graph()
+            self._update_sensor_health()
 
         # Schedule next update
         self.root.after(1000, self.update_status)
@@ -1249,19 +1748,44 @@ class CPUTempMonitorApp:
             diff_actual = actual
             high_thresh = float(self.tray_monitor.high_threshold or 0) if self.tray_monitor else 0.0
 
-        # Update subplot 1: Temperature (always use full times/actual)
-        self.line_actual.set_data(times, actual)
-        if not is_recon:
+        # Update subplot 1: Actual vs Reconstructed/Predicted
+        if is_ae:
+            selected = self.ae_feature_var.get()
+            sensor = 'cpu_temp' if selected == 'All (Global)' else selected
+            actual_buf = list(self.graph_per_feature_actual.get(sensor, []))
+            recon_buf = list(self.graph_per_feature_reconstructed.get(sensor, []))
+
+            # Show actual (full range)
+            n_actual = min(len(times), len(actual_buf))
+            if n_actual > 0:
+                self.line_actual.set_data(times[-n_actual:], actual_buf[-n_actual:])
+            self.line_actual.set_label(f'{sensor} actual')
+
+            # Overlay reconstructed (may start later, shorter buffer)
+            n_recon = min(len(times), len(recon_buf))
+            if n_recon > 0:
+                self.line_predicted.set_data(times[-n_recon:], recon_buf[-n_recon:])
+                self.line_predicted.set_visible(True)
+            else:
+                self.line_predicted.set_visible(False)
+            self.line_predicted.set_label(f'{sensor} reconstructed')
+
+            all_vals = actual_buf + recon_buf if recon_buf else actual_buf
+            self.ax1.set_title(f'{sensor} — Actual vs Reconstructed', fontsize=9)
+            self.ax1.set_ylabel('Value')
+            self.ax1.legend(loc='upper left', fontsize=8)
+        else:
+            self.line_actual.set_data(times, actual)
             self.line_predicted.set_data(times, predicted)
+            self.line_predicted.set_visible(True)
+            all_vals = actual + predicted
 
         # Adjust axes for subplot 1
         if times:
             self.ax1.set_xlim(min(times), max(times) + 1)
-            all_temps = actual if is_recon else actual + predicted
-            if all_temps:
-                min_temp = min(all_temps) - 2
-                max_temp = max(all_temps) + 2
-                self.ax1.set_ylim(min_temp, max_temp)
+            if all_vals:
+                margin = max((max(all_vals) - min(all_vals)) * 0.1, 2)
+                self.ax1.set_ylim(min(all_vals) - margin, max(all_vals) + margin)
 
         # Update subplot 2: Error / Diff with Thresholds
         self.line_diff.set_data(diff_times, diff)
@@ -1292,6 +1816,30 @@ class CPUTempMonitorApp:
         # Redraw canvas
         self.canvas.draw_idle()
 
+    def _update_collect_graph(self):
+        """Update the live sensor graph in the Collect tab."""
+        if not hasattr(self, 'collect_line') or not hasattr(self, 'collect_sensor_var'):
+            return
+
+        sensor = self.collect_sensor_var.get()
+        buf = self.collect_graph_buffers.get(sensor)
+        if not buf:
+            return
+
+        times = list(self.collect_graph_times)
+        values = list(buf)
+        n = min(len(times), len(values))
+        if n == 0:
+            return
+
+        self.collect_line.set_data(times[-n:], values[-n:])
+        self.collect_ax.set_title(sensor, fontsize=9)
+        self.collect_ax.set_xlim(times[-n], times[-1] + 1)
+        if values:
+            margin = max((max(values) - min(values)) * 0.1, 1)
+            self.collect_ax.set_ylim(min(values) - margin, max(values) + margin)
+        self.collect_canvas.draw_idle()
+
     def clear_graph(self):
         """Clear the graph data."""
         self.graph_times.clear()
@@ -1300,6 +1848,10 @@ class CPUTempMonitorApp:
         self.graph_diff.clear()
         self.graph_counter = 0
         for buf in self.graph_per_feature.values():
+            buf.clear()
+        for buf in self.graph_per_feature_reconstructed.values():
+            buf.clear()
+        for buf in self.graph_per_feature_actual.values():
             buf.clear()
 
         # Clear plot lines
@@ -1326,7 +1878,8 @@ class CPUTempMonitorApp:
         self.status_text.insert(tk.END, "Monitoring stopped")
         self.status_text.config(state='disabled')
 
-        # Clear graphs for next session
+        # Hide sensor health panel and clear graphs
+        self.sensor_health_frame.pack_forget()
         self.clear_graph()
 
         # If window is minimized, create simple tray icon
@@ -1361,6 +1914,12 @@ class CPUTempMonitorApp:
                     self.collection_time_counter += 1
                     if len(self.collected_background_data) == 1:
                         self.root.after(0, self.update_train_from_data_state)
+
+                    # Feed collect graph buffers
+                    self.collect_graph_times.append(self.collection_time_counter)
+                    for sensor in self.collect_graph_buffers:
+                        self.collect_graph_buffers[sensor].append(data.get(sensor, 0.0) or 0.0)
+                    self.root.after(0, self._update_collect_graph)
 
                     # Update status
                     self.root.after(0, lambda: self.collection_status_label.config(
@@ -1626,8 +2185,6 @@ class CPUTempMonitorApp:
         self.config.set('last_model_type', self.model_type_var.get())
         self.config.set('multi_variable', self.multi_variable_var.get())
         self.config.set('collection_interval', self.collection_interval_var.get())
-        self.config.set('mean_time', self.mean_time_var.get())
-        self.config.set('monitor_mean_time', self.monitor_mean_time_var.get())
         self.config.set('monitor_anomaly_window', self.monitor_anomaly_window_var.get())
         self.config.set('start_with_windows', self.start_with_windows_var.get())
         self.config.set('auto_start_collection', self.auto_start_collection_var.get())

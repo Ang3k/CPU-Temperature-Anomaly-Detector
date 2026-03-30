@@ -80,8 +80,10 @@ class TrayMonitor:
         # Model type detection
         self.is_autoencoder_model = False
 
-        # Per-feature reconstruction errors (autoencoder only)
+        # Per-feature reconstruction errors and reconstructed values (autoencoder only)
         self.per_feature_errors = {}
+        self.per_feature_reconstructed = {}
+        self.last_sensor_data = {}
 
         # Mean prediction buffering
         self.mean_buffer = []
@@ -105,13 +107,15 @@ class TrayMonitor:
 
     def _process_prediction(self, data: dict):
         """Run anomaly detection on provided data and update state."""
+        self.last_sensor_data = data
         if self.is_autoencoder_model:
-            # Autoencoder returns: (is_anomaly, reconstruction_error, threshold, actual, per_feature_errors)
-            is_anomaly_raw, recon_error, threshold, actual, per_feat = self.regressor.detect_anomaly(data)
+            # Autoencoder returns: (is_anomaly, reconstruction_error, threshold, actual, per_feature_errors, per_feature_reconstructed)
+            is_anomaly_raw, recon_error, threshold, actual, per_feat, per_feat_recon = self.regressor.detect_anomaly(data)
             self.reconstruction_error = recon_error
             self.last_diff = recon_error
             self.predicted_temp = 0.0
             self.per_feature_errors = per_feat or {}
+            self.per_feature_reconstructed = per_feat_recon or {}
         else:
             # Regressor returns: (is_anomaly, diff, predicted, actual)
             is_anomaly_raw, diff, predicted, actual = self.regressor.detect_anomaly(data)

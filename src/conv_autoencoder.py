@@ -80,7 +80,6 @@ class ConvAutoencoder(nn.Module):
             decoder_layers.append(nn.ReLU())
             decoder_current = out_channels
         decoder_layers.append(nn.Conv1d(decoder_current, input_dim, kernel_size=3, stride=1, padding=1))
-        decoder_layers.append(nn.Sigmoid())
         self.decoder = nn.Sequential(*decoder_layers)
 
     def make_windows(self, data):
@@ -192,8 +191,8 @@ class ConvAutoencoder(nn.Module):
         all_original = np.concatenate(all_original, axis=0)
         all_reconstructed = np.concatenate(all_reconstructed, axis=0)
 
-        original = all_original[:, 0, :]
-        reconstruido = all_reconstructed[:, 0, :]
+        original = all_original[:, -1, :]
+        reconstruido = all_reconstructed[:, -1, :]
 
         original_denorm = self.scaler.inverse_transform(original)
         reconstruido_denorm = self.scaler.inverse_transform(reconstruido)
@@ -284,7 +283,7 @@ class ConvAutoencoder(nn.Module):
     def evaluate_metrics(self):
         """Calculate and return evaluation metrics for reconstruction."""
         if self.erros is None:
-            self.erros, self.threshold = self.reconstruction_error()
+            self.erros, self.threshold, self.erros_per_feature = self.reconstruction_error()
 
         mean_error = np.mean(self.erros)
         std_error = np.std(self.erros)
@@ -346,15 +345,11 @@ class ConvAutoencoder(nn.Module):
 
         # Not enough data yet to fill a window
         if len(self.realtime_buffer) < self.window_size:
-            return False, 0.0, self.high_threshold or 0.0, actual, None
+            return False, 0.0, self.high_threshold or 0.0, actual, None, None
 
         # Build window, scale, and run through model
         window = np.array(list(self.realtime_buffer), dtype=np.float32)
         window_scaled = self.scaler.transform(window)
-        # Clip to [0, 1] to match training conditions — the decoder uses Sigmoid
-        # which can only output [0, 1], so out-of-range inputs create irreducible
-        # error that causes false anomalies
-        window_scaled = np.clip(window_scaled, 0.0, 1.0)
 
         # Shape: (1, window_size, features) -> permute to (1, features, window_size) for Conv1d
         x = torch.tensor(window_scaled, dtype=torch.float32).unsqueeze(0).permute(0, 2, 1)
@@ -366,12 +361,16 @@ class ConvAutoencoder(nn.Module):
             error = float(((output - x) ** 2).mean())
             # Per-feature error: mean over window dim only
             feat_errors = ((output - x) ** 2).mean(dim=2).squeeze(0).numpy()  # (n_features,)
+            # Last timestep of reconstructed window, inverse-transformed to real units
+            recon_last = output.permute(0, 2, 1).squeeze(0)[-1:].numpy()  # (1, n_features)
+            recon_values_raw = self.scaler.inverse_transform(recon_last)[0]  # (n_features,)
 
         per_feature_errors = {col: float(feat_errors[i]) for i, col in enumerate(self.feature_columns)}
+        per_feature_reconstructed = {col: float(recon_values_raw[i]) for i, col in enumerate(self.feature_columns)}
 
         is_anomaly = error > self.high_threshold
 
-        return is_anomaly, error, self.high_threshold, actual, per_feature_errors
+        return is_anomaly, error, self.high_threshold, actual, per_feature_errors, per_feature_reconstructed
 
     def save_model(self, path: str):
         """Save the trained model (weights + metadata) to file."""
