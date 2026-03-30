@@ -10,7 +10,7 @@ cpu_temp_detector/
 │   ├── __init__.py
 │   ├── cpu_temp_bundled.py     # Interface com LibreHardwareMonitor
 │   ├── core_regressor.py       # Modelos de regressão para detecção de anomalias
-│   ├── conv_autoencoder.py     # Autoencoder convolucional para erro de reconstrução
+│   ├── conv_autoencoder.py     # Autoencoder convolucional (CNN) para erro de reconstrução
 │   ├── data_extractor.py       # Extração e engenharia de features
 │   ├── tray_monitor.py         # Monitor de bandeja do sistema
 │   └── lib/                    # DLLs do LibreHardwareMonitor
@@ -18,7 +18,7 @@ cpu_temp_detector/
 │       └── LibreHardwareMonitorLib.dll
 ├── data/                   # Dados de treino
 │   └── *.csv
-├── models/                 # Modelos treinados (.joblib)
+├── models/                 # Modelos treinados
 │   ├── cpu_temp_model_linear.joblib
 │   ├── cpu_temp_model_xgb.joblib
 │   ├── cpu_temp_model_lightgbm.joblib
@@ -42,55 +42,88 @@ Dependências principais:
 - `plyer` - Notificações Windows
 - `PyYAML` - Configuração
 - `scikit-learn`, `xgboost`, `lightgbm` - Machine Learning
+- `torch` - PyTorch (autoencoder)
 - `pandas`, `numpy` - Processamento de dados
+- `matplotlib` - Gráficos em tempo real
 
 ## Como Usar
 
-### 1. Execute o Aplicativo
+O aplicativo possui 6 abas organizadas em um fluxo lógico:
 
-```bash
-python app.py
-```
+**Guide → Collect → Train → Monitor → Log → Settings**
 
-### 2. Treine um Modelo
+### 1. Guide (Guia)
 
-Na aba **Train**:
-- Selecione a abordagem: **Regressor** (regressão) ou **Autoencoder** (erro de reconstrução)
-- Para Regressor: escolha o modelo (Linear, XGBoost, LightGBM)
-- Para Autoencoder: configure janela, épocas, learning rate e batch size
-- Selecione o scaler (Standard, MinMax, Robust)
-- Colete dados usando a **coleta em background** ou carregue de **arquivo(s) CSV**
-- Opcionalmente, defina **mean time** para reamostrar os dados por janelas de tempo
-- Clique em "Train From Data"
-- Clique em "Save Model" quando terminar
+Aba de boas-vindas com explicações para novos usuários:
+- Como o sistema funciona
+- Passo a passo para começar (Coletar → Treinar → Monitorar → Analisar)
+- Conceitos-chave: Anomalia, Threshold, Erro de Reconstrução, Window Size
+- Dicas de uso
+- Botão "Get Started" para ir direto à coleta
 
-### 3. Inicie o Monitoramento
+### 2. Collect (Coleta de Dados)
 
-Na aba **Monitor**:
-- Selecione o modelo treinado (`.joblib` ou `.pt`) — detecta automaticamente se é Regressor ou Autoencoder
-- Configure o threshold de anomalia (padrão: 1.5 std)
-- Configure a **janela de anomalia** (número de anomalias consecutivas antes de alertar)
-- Clique em "Start Monitoring"
-- Minimize para a bandeja do sistema
+Colete dados dos sensores do computador para treinar o modelo:
+- **Coleta em background**: Defina duração e intervalo, acompanhe em tempo real
+- **Carregar CSVs**: Importe dados previamente coletados
+- **Gráfico ao vivo**: Visualize os sensores sendo coletados em tempo real, com seletor de sensor
+- Botão "Go to Train →" para avançar ao treinamento
 
-### 4. Receba Alertas
+### 3. Train (Treinamento)
 
-- O ícone na bandeja fica:
-  - **Verde**: Temperatura normal
-  - **Vermelho**: Anomalia detectada
-- Notificações Windows aparecem quando anomalias são detectadas
-- Clique com botão direito no ícone para acessar o menu
+Treine o modelo de detecção de anomalias:
+- **Step 1 — Escolha o modelo**:
+  - **Regressor**: Linear (Ridge), XGBoost ou LightGBM
+  - **Autoencoder**: CNN com parâmetros configuráveis (window size, épocas, learning rate, batch size)
+- **Step 2 — Treine**: Clique em "Train From Data" e acompanhe o progresso
+- **Step 3 — Salve**: Salve o modelo treinado e use-o no monitoramento
+
+### 4. Monitor (Monitoramento)
+
+Monitore a CPU em tempo real com detecção de anomalias:
+- Selecione o modelo treinado (`.joblib` para regressor, `.pt` para autoencoder)
+- Configure o threshold e a janela de anomalia
+- **Gráfico em tempo real**: Visualize dados reais vs reconstruídos por sensor (autoencoder)
+- **Painel de saúde dos sensores**: 7 indicadores coloridos mostrando estado de cada sensor
+  - Verde (Healthy) / Vermelho (Anomaly)
+  - Sensores monitorados: CPU Temp, CPU Load, CPU Power, GPU Temp, GPU Load, GPU Power, RAM Load
+- **Classificação de anomalias**: O sistema categoriza automaticamente o tipo de anomalia:
+  - **Cooling problem** — Temperaturas altas sem carga correspondente
+  - **Heavy workload** — Temperaturas e cargas altas simultaneamente
+  - **GPU isolated** — Anomalia isolada na GPU
+  - **Power anomaly** — Anomalia nos sensores de energia
+  - **Memory pressure** — Anomalia isolada na RAM
+  - **Single sensor spike** — Apenas um sensor anômalo
+  - **Unknown pattern** — Combinação não classificada
+- Minimize para a bandeja do sistema com ícone colorido (verde/vermelho)
+
+### 5. Log (Registro de Anomalias)
+
+Histórico completo das anomalias detectadas:
+- **Estatísticas resumidas**: Total de anomalias, categoria mais frequente, último evento
+- **Tabela detalhada**: Horário, categoria, sensores afetados, temperaturas, erro de reconstrução
+- **Linhas coloridas** por categoria para identificação visual rápida
+- **Exportar para CSV**: Salve o histórico para análise posterior
+- **Limpar log**: Reinicie o registro
+
+### 6. Settings (Configurações)
+
+- Caminho do modelo
+- Threshold de anomalia
+- Intervalo de verificação
+- Janela de anomalia (anomalias consecutivas para confirmar)
+- Notificações habilitadas/desabilitadas
+- Minimizar para bandeja
 
 ## Configuração
 
 Edite `config.yaml` ou use a aba **Settings** na GUI:
 
 ```yaml
-model_path: models/cpu_temp_model_lightgbm.joblib
-model_approach: regressor          # 'regressor' ou 'autoencoder'
+model_path: models/cpu_temp_model_autoencoder.pt
+model_approach: autoencoder        # 'regressor' ou 'autoencoder'
 threshold_std: 1.5
 check_interval: 5
-mean_time: 5                       # Janela de reamostragem em segundos (opcional)
 monitor_anomaly_window: 1          # Anomalias consecutivas para confirmar alerta
 multi_variable: true               # Usar todos os sensores ou apenas tempo
 notifications_enabled: true
@@ -100,10 +133,10 @@ minimize_to_tray: true
 ## Como Funciona
 
 1. **Coleta de Dados**: Coleta em background ou carregamento de CSVs (sensores via LibreHardwareMonitor)
-2. **Reamostragem** (opcional): Agrega dados por janelas de tempo (mean time)
-3. **Feature Engineering**: Cria features de lag, rolling statistics, e diferenças
-4. **Treinamento**: Treina modelo de regressão ou autoencoder para detectar comportamento normal
-5. **Detecção**: Identifica anomalias quando a diferença ou o erro de reconstrução excede o threshold
+2. **Feature Engineering**: Cria features de lag, rolling statistics e diferenças
+3. **Treinamento**: Treina modelo de regressão ou autoencoder para aprender o comportamento normal
+4. **Detecção**: Identifica anomalias quando o erro excede o threshold
+5. **Classificação**: Categoriza a anomalia com base nos sensores afetados
 6. **Janela de Anomalia**: Requer N anomalias consecutivas antes de alertar, evitando falsos positivos
 
 ## Abordagens de Detecção
@@ -115,11 +148,14 @@ Prevê a temperatura "normal" da CPU com base nos outros sensores. Anomalias sã
 - **XGBoost**: Ótimo para padrões complexos
 - **LightGBM**: Balanceado entre velocidade e precisão (recomendado)
 
-### Autoencoder
-Usa erro de reconstrução em janelas temporais para detectar anomalias. Dados que não se encaixam no padrão aprendido geram alto erro de reconstrução.
+### Autoencoder (CNN)
+Usa erro de reconstrução em janelas temporais para detectar anomalias multivariadas. Dados que não se encaixam no padrão aprendido geram alto erro de reconstrução.
 
-- Aprende padrões multivariados ao longo do tempo
-- Permite acompanhar erro global e erro por sensor
+- Aprende padrões multivariados ao longo do tempo (7 sensores simultâneos)
+- Erro de reconstrução global e **por sensor** (per-feature)
+- Thresholds individuais por sensor para detecção granular
+- Visualização de dados reais vs reconstruídos em tempo real
+- Classificação automática do tipo de anomalia
 
 ## Desenvolvimento
 
@@ -140,10 +176,15 @@ jupyter notebook notebooks/cpu_temp.ipynb
 Execute o Python/terminal como Administrador.
 
 ### Modelo não detecta anomalias
-- Aumente o threshold_std nas configurações
+- Ajuste o threshold_std nas configurações
 - Treine com mais dados (colete por mais tempo ou combine mais CSVs)
-- Verifique se os dados de treino são representativos
+- Verifique se os dados de treino são representativos do uso normal
+- Para autoencoder: experimente diferentes window sizes
 
 ### Notificações não aparecem
 - Verifique se notificações estão habilitadas no Windows
 - Ative `notifications_enabled: true` no config.yaml
+
+### Erro de reconstrução alto mesmo em condições normais
+- Retreine o modelo com dados mais representativos
+- Verifique se o scaler está adequado aos seus dados (Standard, MinMax, Robust)
