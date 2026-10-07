@@ -39,3 +39,9 @@ desktop.ini
 
 # Old folder (to be deleted)
 cpu_temperature_detector/
+
+# Ferramentas de IA (locais)
+.claude/
+docs/superpowers/
+AGENTS.md
+CLAUDE.md
